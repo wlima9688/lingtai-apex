@@ -78,4 +78,4 @@ cd bootanim/tools && swiftc -O -o wblaunch wblaunch.swift && cd ../..
 
 MIT，见 [LICENSE](LICENSE)。
 
-私有路径（`/Users/wanli/...`）出现在部分脚本里，是作者本机配置；换机器时按需调整。
+私有路径（`/Users/<用户名>/...`）若出现在部分脚本里，是作者本机配置；换机器时按需调整。
