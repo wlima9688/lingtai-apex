@@ -78,4 +78,9 @@ cd bootanim/tools && swiftc -O -o wblaunch wblaunch.swift && cd ../..
 
 MIT，见 [LICENSE](LICENSE)。
 
+字体另行授权：`scripts/Resources/Fonts/` 下的 Inter 与 Roboto Mono 均为 SIL Open Font License 1.1，
+全文见 [`LICENSE-Inter.txt`](scripts/Resources/Fonts/LICENSE-Inter.txt) 与
+[`LICENSE-RobotoMono.txt`](scripts/Resources/Fonts/LICENSE-RobotoMono.txt)，
+来源与说明见 [`references/字体授权.md`](references/字体授权.md)。
+
 私有路径（`/Users/<用户名>/...`）若出现在部分脚本里，是作者本机配置；换机器时按需调整。
