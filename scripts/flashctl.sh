@@ -17,7 +17,7 @@
 #   flashctl.sh key f5 "ctrl+alt"  改热键并重装自启（默认 ⌃⌥S）
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LABEL="com.shankong.flash"
+LABEL="com.lingtai.apex"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 FLASH="$DIR/flash"
 # ⚠ 装了登录项以后，真正在跑的是 /Applications/灵台智枢.app（SMAppService 只认这里）。
@@ -25,7 +25,7 @@ FLASH="$DIR/flash"
 if [ -d "/Applications/灵台智枢.app" ]; then
   APP_BUNDLE="/Applications/灵台智枢.app"
 else
-  APP_BUNDLE="$DIR/闪控.app"
+  APP_BUNDLE="$DIR/灵台智枢.app"
 fi
 LOG="/tmp/flash.log"
 
@@ -48,7 +48,7 @@ is_running() { flash_pid > /dev/null 2>&1; }
 
 write_plist() {
   mkdir -p "$HOME/Library/LaunchAgents"
-  # ⚠ 为什么用 `open -g -a 闪控.app` 而不是直接跑二进制：
+  # ⚠ 为什么用 `open -g -a 灵台智枢.app` 而不是直接跑二进制：
   #   裸二进制由 shell 拉起时，**进程会跟着父 shell 一起被回收**（实测：
   #   调用一结束进程就没了，用户按热键当然没反应）；经 LaunchServices 启动的
   #   进程由 launchd 托管，能一直活着，而且带 app 身份（可双击、可进登录项）。
@@ -63,7 +63,7 @@ write_plist() {
     <string>$LABEL</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$DIR/闪控.app/Contents/MacOS/flash</string>
+        <string>$DIR/灵台智枢.app/Contents/MacOS/flash</string>
 $EXTRA_ARGS    </array>
     <key>RunAtLoad</key>
     <true/>
@@ -93,7 +93,7 @@ PLISTEOF
   plutil -lint "$PLIST" > /dev/null 2>&1 || { echo "❌ plist 语法错误"; exit 1; }
 }
 
-# ── 闪控.app：可双击、可放进登录项的外壳 ──────────────────────────
+# ── 灵台智枢.app：可双击、可放进登录项的外壳 ──────────────────────────
 # ⚠ 为什么需要：裸 Mach-O 二进制没有 bundle，用户没法「双击启动」，
 #   也没法在「登录项」里选它（登录项只收 .app）。而 launchd 的
 #   bootstrap 在某些环境会被拦（本机实测 I/O error），所以要有一条
@@ -101,7 +101,7 @@ PLISTEOF
 # ⚠ 为什么壳里是 exec 原二进制，而不是复制一份：复制会换掉路径，
 #   辅助功能授权（TCC）按路径+签名认人，复制等于要用户重新授权一次。
 make_app() {
-  local APP="$DIR/闪控.app"
+  local APP="$DIR/灵台智枢.app"
   mkdir -p "$APP/Contents/MacOS"
   cat > "$APP/Contents/Info.plist" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -110,7 +110,7 @@ make_app() {
 <dict>
   <key>CFBundleName</key><string>灵台智枢</string>
   <key>CFBundleDisplayName</key><string>灵台智枢</string>
-  <key>CFBundleIdentifier</key><string>com.shankong.flash</string>
+  <key>CFBundleIdentifier</key><string>com.lingtai.apex</string>
   <key>CFBundleExecutable</key><string>flash</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.9.1</string>
@@ -132,6 +132,18 @@ PLISTEOF
   rm -f "$APP/Contents/MacOS/run"
   cp -f "$DIR/flash" "$APP/Contents/MacOS/flash"
   chmod +x "$APP/Contents/MacOS/flash"
+  # 字体随包走：scripts/Resources/Fonts → Contents/Resources/Fonts。
+  # ⚠ 只把文件塞进 bundle 是不够的 —— AppKit 不会自动登记，必须由 flash 启动时
+  #   用 CTFontManagerRegisterFontsForURL 注册（见 flash.swift 的 BundledFonts）。
+  #   这里漏拷的直接后果是「字体没生效」，而面板会静默回退到系统字体：
+  #   看起来只是"没那么好看"，不会报错，所以拷贝放在 cp 旁边的同一段里。
+  if [ -d "$DIR/Resources/Fonts" ]; then
+    mkdir -p "$APP/Contents/Resources/Fonts"
+    cp -f "$DIR/Resources/Fonts/"*.ttf "$APP/Contents/Resources/Fonts/" 2>/dev/null || true
+    cp -f "$DIR/Resources/Fonts/"LICENSE-*.txt "$APP/Contents/Resources/Fonts/" 2>/dev/null || true
+  else
+    echo "   ⚠️ 没找到 $DIR/Resources/Fonts —— 本次 bundle 不含字体，将回退系统字体"
+  fi
   # 让 LaunchServices 重新读一遍 Info.plist（否则它可能还按旧的可执行名启动）
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" >/dev/null 2>&1 || true
   echo "✅ 已生成 $APP"
@@ -205,7 +217,7 @@ case "$cmd" in
     "$FLASH" --status 2>&1 | grep -E "目标热键|Carbon 注册|事件监听|运行中实例" | sed 's/^/    /'
     echo ""
     echo "  开场动画: $([ -x "$DIR/bootanim/tools/wblaunch" ] && echo 'wblaunch ✅' || echo 'wblaunch ❌ 未编译')"
-    if launchctl list 2>/dev/null | grep -q "com.shankong.wbboot"; then
+    if launchctl list 2>/dev/null | grep -q "com.lingtai.bootanim"; then
       echo "  开机动画自启: ✅ 已注册（重启后先播动画再弹 WorkBuddy）"
     else
       echo "  开机动画自启: ❌ 未注册（重启不播动画）→ flashctl.sh install-boot"
@@ -227,7 +239,7 @@ case "$cmd" in
   # 复制后签名与 TCC 要求不变（identifier + 证书根），授权继续有效。
   install-app)
     make_app
-    /usr/bin/ditto "$DIR/闪控.app" "/Applications/灵台智枢.app" || { echo "❌ 复制失败"; exit 1; }
+    /usr/bin/ditto "$DIR/灵台智枢.app" "/Applications/灵台智枢.app" || { echo "❌ 复制失败"; exit 1; }
     echo "✅ 已安装到 /Applications/灵台智枢.app"
     APP_BUNDLE="/Applications/灵台智枢.app"
     is_running && { kill "$(flash_pid)" 2>/dev/null; sleep 1; }
@@ -256,13 +268,13 @@ case "$cmd" in
       ID="-"
     fi
     make_app
-    # --identifier 固定成 com.shankong.flash：ad-hoc 时它会被写成 flash-<uuid>，
+    # --identifier 固定成 com.lingtai.apex：ad-hoc 时它会被写成 flash-<uuid>，
     # 那样 TCC 的指定要求每次都变，白签。固定 identifier + 固定证书 = 稳定身份。
-    codesign --force --identifier com.shankong.flash --sign "$ID" "$DIR/flash" 2>&1 | tail -2
-    codesign --force --deep --sign "$ID" "$DIR/闪控.app" 2>&1 | tail -2
+    codesign --force --identifier com.lingtai.apex --sign "$ID" "$DIR/flash" 2>&1 | tail -2
+    codesign --force --deep --sign "$ID" "$DIR/灵台智枢.app" 2>&1 | tail -2
     echo "—— 签名结果 ——"
     codesign -dv "$DIR/flash" 2>&1 | grep -E "Identifier|Authority|Signature"
-    codesign -dv "$DIR/闪控.app" 2>&1 | grep -E "Identifier|Authority|Signature"
+    codesign -dv "$DIR/灵台智枢.app" 2>&1 | grep -E "Identifier|Authority|Signature"
     echo "✅ 已签名。到「系统设置 > 隐私与安全性 > 辅助功能」里勾一次「闪控」，之后重编译不必再勾。"
     ;;
 
@@ -291,8 +303,8 @@ case "$cmd" in
       echo "① 程序        ❌ 没编译 → ./build_flash.sh"; bad=1
     fi
     # 2 .app 外壳
-    if [ -d "$DIR/闪控.app" ]; then
-      echo "② 应用外壳    ✅ 闪控.app（可双击启动）"
+    if [ -d "$DIR/灵台智枢.app" ]; then
+      echo "② 应用外壳    ✅ 灵台智枢.app（可双击启动）"
     else
       echo "② 应用外壳    ⚠️  缺 → ./flashctl.sh app（不影响热键）"
     fi
@@ -342,11 +354,11 @@ case "$cmd" in
              echo "   辅助功能    ⚠️  运行实例没有辅助功能授权（面板的 AX 动作会退化）"
            fi
            echo "               ★ 一次性做法：把下面这个 app 拖进「辅助功能」列表并打开开关"
-           echo "                 $DIR/闪控.app"
+           echo "                 $DIR/灵台智枢.app"
            echo "                 （已经勾了「flash」也可能无效：旧条目绑的是老签名，"
            echo "                   拖 app 进去才会按当前证书登记）"
            echo "                 打开面板：open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'"
-           echo "                 打开文件夹：open -R '$DIR/闪控.app'" ;;
+           echo "                 打开文件夹：open -R '$DIR/灵台智枢.app'" ;;
       esac
       case "$st" in
         *"key=1 active=1 fr=NSTextView"*) echo "   面板焦点    ✅ 窗口是 key、App 已激活、输入框已聚焦" ;;
@@ -588,7 +600,7 @@ PYEOF
     tail -20 /tmp/flash.err.log 2>/dev/null
     ;;
 
-  # ── 开机开场动画的自启注册（com.shankong.wbboot → wblaunch boot）───────
+  # ── 开机开场动画的自启注册（com.lingtai.bootanim → wblaunch boot）───────
   # ⚠⚠ 2026-10-22 实测教训：这个 plist 曾经**躺在磁盘上但从没被 bootstrap**，
   #   症状就是「重启后开场动画根本不弹，/tmp/wbboot.log 连文件都不存在」。
   #   plist 存在 ≠ 注册成功 —— 判据只有一个：launchctl list 里有没有这个 label。
@@ -597,7 +609,7 @@ PYEOF
   install-boot)
     WBL="$DIR/bootanim/tools/wblaunch"
     [ -x "$WBL" ] || { echo "❌ wblaunch 未编译：cd $DIR/bootanim/tools && swiftc -O -o wblaunch wblaunch.swift"; exit 1; }
-    WBLABEL="com.shankong.wbboot"
+    WBLABEL="com.lingtai.bootanim"
     WBPLIST="$HOME/Library/LaunchAgents/$WBLABEL.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
     cat > "$WBPLIST" <<PLISTEOF
@@ -638,7 +650,7 @@ PLISTEOF
     ;;
 
   uninstall-boot)
-    WBLABEL="com.shankong.wbboot"
+    WBLABEL="com.lingtai.bootanim"
     launchctl bootout "gui/$(id -u)/$WBLABEL" 2>/dev/null
     launchctl unload "$HOME/Library/LaunchAgents/$WBLABEL.plist" 2>/dev/null
     rm -f "$HOME/Library/LaunchAgents/$WBLABEL.plist"

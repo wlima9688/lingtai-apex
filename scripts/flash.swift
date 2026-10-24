@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import CoreText
 import ServiceManagement
 import Carbon
 import ApplicationServices
@@ -224,7 +225,7 @@ enum Layout {
 /// 脚本目录（macctl / route.sh / screen_rec.sh 都在这里）。
 ///
 /// ⚠⚠ 这个函数曾经只是「可执行文件所在目录」，而闪控现在装在
-///   `/Applications/闪控.app/Contents/MacOS/flash` 里 —— 那里**没有 macctl**。
+///   `/Applications/灵台智枢.app/Contents/MacOS/flash` 里 —— 那里**没有 macctl**。
 ///   后果：面板上所有常用操作点了都没反应（runMacctl 找不到可执行文件，
 ///   直接返回空字符串，错误被吞掉）。用户看到的就是"点了没有任何回应"。
 ///   修法：按可信度依次回退，找到真正放着 macctl 的目录为止。
@@ -700,8 +701,8 @@ func writeHotKeyState(note: String = "") {
     let path = "/tmp/flash.hotkey"
     let carbon = gHotKey != nil ? 1 : 0
     let tap = gTapPort != nil ? 1 : 0
-    // ⚠ ax 要一起记：经 LaunchServices（open -a 闪控.app）启动时，进程的 TCC
-    //   身份变成「闪控.app」，而辅助功能是按 app 授权的 —— 裸二进制有授权、
+    // ⚠ ax 要一起记：经 LaunchServices（open -a 灵台智枢.app）启动时，进程的 TCC
+    //   身份变成「灵台智枢.app」，而辅助功能是按 app 授权的 —— 裸二进制有授权、
     //   app 身份可能没有，表现就是「热键能按（Carbon 不需要授权），但事件监听
     //   装不上、合成按键测不了」。不写这一位，就只能靠猜。
     let ax = AXIsProcessTrusted() ? 1 : 0
@@ -1028,11 +1029,16 @@ final class TileButton: NSButton {
     /// 文字排版：先按 12.5pt 排，放不下就逐步缩到 9.5pt，再放不下才截断。
     /// ⚠ 这就是"超格"的根治点：以前是把 12pt 硬塞进固定宽度里，
     ///   「WPS文档」「WorkBuddy」这类长标签必然溢出按钮边框。
+    /// ⚠⚠ 字体换了（2026-10-25：系统字体 → Inter）之后**这个循环就是唯一的
+    ///   溢出口**：Inter 的字面比 SF Pro 略宽，同一字号下「iKuuuVPN」
+    ///   「DeepSeek Harness」会比以前长 2–4pt。所以这里必须跟着 uiFont 走，
+    ///   不能继续写死 systemFont —— 否则按钮文字还是 SF Pro，
+    ///   只有标题变了，屏幕上会同时出现三套字。
     func fitAttributes(maxWidth: CGFloat) -> NSAttributedString {
         var size: CGFloat = 12.5
         while size >= 9.5 {
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: size, weight: .medium),
+                .font: uiFont(size: size, weight: .medium),
                 .foregroundColor: Palette.title,
             ]
             let s = NSAttributedString(string: title, attributes: attrs)
@@ -1042,7 +1048,7 @@ final class TileButton: NSButton {
         let p = NSMutableParagraphStyle()
         p.lineBreakMode = .byTruncatingTail
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 9.5, weight: .medium),
+            .font: uiFont(size: 9.5, weight: .medium),
             // 反白牌上的字必须是深墨：白字压白牌等于没有字
             .foregroundColor: kind == .accent ? Palette.plaqueInk : Palette.title,
             .paragraphStyle: p,
@@ -1319,30 +1325,136 @@ enum WorkBuddyGlyph {
     }
 }
 
+// MARK: - 自带字体（Inter / Roboto Mono）
+
+/// 随 app 一起打包的字体，启动时注册进当前进程。
+///
+/// 为什么必须自己注册：Inter 和 Roboto Mono 都不在 macOS 的系统字体表里。
+/// 只把文件塞进 bundle 是不生效的 —— `NSFont(name:)` 会返回 nil，
+/// 然后代码静默退回系统字体，屏幕上看不出任何变化。这种"改了但没生效"
+/// 是最难发现的一类失败，所以这里把「注册成功没有」显式记下来。
+///
+/// ⚠ 只认**静态 .ttf/.otf**：CoreText 的 CTFontManager 不支持 woff2
+///   （网页字体），塞进来只会注册失败。
+enum BundledFonts {
+    /// (文件名去掉扩展名, PostScript 名)。`NSFont(name:)` 认的是 PS 名。
+    static let files: [(file: String, ps: String)] = [
+        ("Inter-Regular",     "Inter-Regular"),
+        ("Inter-Medium",      "Inter-Medium"),
+        ("Inter-SemiBold",    "Inter-SemiBold"),
+        ("RobotoMono-Regular","RobotoMono-Regular"),
+        ("RobotoMono-Medium", "RobotoMono-Medium"),
+    ]
+
+    /// 注册成功的 PS 名。空集 = 全部退回系统字体。
+    private(set) static var ready: Set<String> = []
+    /// 实际使用的字体目录（诊断用）
+    private(set) static var dir: String = "—"
+
+    /// 字体目录的候选位置。按优先级：
+    ///   ① `灵台智枢.app/Contents/Resources/Fonts` —— 打包后的正路
+    ///   ② 可执行文件同级 `scripts/Resources/Fonts` —— 直接跑裸二进制
+    ///      （`./flash --layout-check`）时 Bundle.main 是 nil，这条是主力
+    ///   ③ 向上两级 `scripts/../Resources/Fonts` —— 兜底
+    static func locate() -> URL? {
+        var cands: [URL] = []
+        if let r = Bundle.main.resourceURL {
+            cands.append(r.appendingPathComponent("Fonts"))
+        }
+        let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        let exeDir = exe.deletingLastPathComponent()
+        cands.append(exeDir.appendingPathComponent("Resources/Fonts"))
+        cands.append(exeDir.deletingLastPathComponent()
+                        .appendingPathComponent("Resources/Fonts"))
+        for c in cands where FileManager.default.fileExists(atPath: c.path) { return c }
+        return nil
+    }
+
+    /// 注册。返回是否至少有一个字体可用。
+    @discardableResult
+    static func register() -> Bool {
+        guard let d = locate() else {
+            dir = "未找到 Resources/Fonts"
+            return false
+        }
+        dir = d.path
+        var ok = 0
+        for f in files {
+            let url = d.appendingPathComponent(f.file + ".ttf")
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            var err: Unmanaged<CFError>?
+            // .process 作用域：只对本进程有效，不污染系统字体表。
+            // 已注册过会返回 false（"already registered"），那不算失败。
+            let r = CTFontManagerRegisterFontsForURL(url as CFURL, .process, &err)
+            if r || NSFont(name: f.ps, size: 10) != nil {
+                ready.insert(f.ps); ok += 1
+            }
+        }
+        return ok == files.count
+    }
+}
+
 // MARK: - 文字标签
 
-/// UI 字体：Avenir Next 优先，取不到就退回系统字体（宁可字形变，也不能缺字）。
+/// UI 字体：Inter 优先，取不到就退回系统字体（宁可字形变，也不能缺字）。
+///
+/// 为什么是 Inter 而不是继续用 Avenir Next（用户 2026-10-25 定）：
+/// 要求是「工整、能轻松看清、不许花式」。Inter 是专为屏幕小字号设计的
+/// 中性无衬线：x-height 大、开口宽、字重齐（Regular/Medium/SemiBold），
+/// 和数据区的 Roboto Mono 同属「仪表」语汇，比 Avenir Next 的几何感更"正"。
+///
+/// ⚠ Inter 不含汉字。中文会走 CoreText 的级联回退（系统中文字体），
+///   这是对的 —— 强行塞一个中文字体反而会和西文基线打架。
 func uiFont(size: CGFloat, weight: NSFont.Weight) -> NSFont {
+    // 只有三档静态字重，所以 .bold / .black 也只能落到 SemiBold。
+    // 不去合成假粗体：合成加粗在 9–12pt 的西文和数字上会把笔画糊死，
+    // 那比"不够粗"难看得多，也更难读。
     let name: String
     switch weight {
-    case .bold, .heavy, .black:      name = "AvenirNext-Bold"
-    case .semibold:                  name = "AvenirNext-DemiBold"
-    case .medium:                    name = "AvenirNext-Medium"
-    default:                         name = "AvenirNext-Regular"
+    case .bold, .heavy, .black, .semibold: name = "Inter-SemiBold"
+    case .medium:                          name = "Inter-Medium"
+    default:                               name = "Inter-Regular"
     }
-    if let f = NSFont(name: name, size: size) { return f }
+    if BundledFonts.ready.contains(name), let f = NSFont(name: name, size: size) {
+        return f
+    }
+    // 退回旧逻辑：Avenir Next（系统自带）→ 系统字体
+    let fb: String
+    switch weight {
+    case .bold, .heavy, .black:      fb = "AvenirNext-Bold"
+    case .semibold:                  fb = "AvenirNext-DemiBold"
+    case .medium:                    fb = "AvenirNext-Medium"
+    default:                         fb = "AvenirNext-Regular"
+    }
+    if let f = NSFont(name: fb, size: size) { return f }
     return .systemFont(ofSize: size, weight: weight)
+}
+
+/// 等宽字体：Roboto Mono 优先，取不到退回系统等宽（SF Mono）。
+///
+/// 为什么数据区必须是等宽：自检栏是「键左值右」的表格，数字要能上下对齐；
+/// 比例字体里 1 和 8 的宽度不同，竖着看就歪了。Roboto Mono 比 SF Mono
+/// 略窄、字重更均匀，和 Inter 并排时不会一个偏粗一个偏细。
+func monoFont(size: CGFloat, weight: NSFont.Weight) -> NSFont {
+    // 同样只有两档静态字重：常规 / 中等。.bold 也落到 Medium。
+    let name = (weight == .regular || weight == .light || weight == .thin)
+        ? "RobotoMono-Regular" : "RobotoMono-Medium"
+    if BundledFonts.ready.contains(name), let f = NSFont(name: name, size: size) {
+        return f
+    }
+    return .monospacedSystemFont(ofSize: size, weight: weight)
 }
 
 func makeLabel(_ s: String, size: CGFloat, weight: NSFont.Weight,
                color: NSColor, align: NSTextAlignment = .left,
                kern: CGFloat = 0) -> NSTextField {
     let t = NSTextField(labelWithString: s)
-    /* 字体：标题与区块名用 Avenir Next（macOS 自带，OFL 无版权问题）。
+    /* 字体：标题与区块名走 Inter（随包带的 OFL 字体，见 BundledFonts）。
        为什么不是参考项目那套 Jura：用户 2026-10-25 明确「不能是花式，要工整、
-       能轻松看清」。Jura 的几何字形在 8–11pt 上辨识度明显弱于 Avenir Next，
-       而 Avenir Next 是苹果系统里最"正"的无衬线之一：字面宽、开口大、
-       小字号不糊边。数据行仍走 SF Mono（等宽对齐比"好看"重要）。 */
+       能轻松看清」。Inter 在 8–11pt 上字面宽、开口大、数字不糊边，
+       和右侧数据栏的 Roboto Mono 是同一种"仪表"语汇。
+       之前用的 Avenir Next 也是好字体，但它是**比例几何体**，混排时
+       和等宽数据栏的节奏对不上 —— 这就是"两套字"的来源。 */
     t.font = uiFont(size: size, weight: weight)
     t.textColor = color
     t.alignment = align
@@ -1452,6 +1564,7 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
     /// 右侧三维自转地球（工业档案画风）
     var globe: GlobeView!
     private var watermark: GlobeWatermark?
+    private var noiseLayer: NoiseView?
     private var watermarkTick = 0
     // 启动动画设置卡的控件（值来自 bootanim/bootanim.config.json）
     private var bootName: NSTextField?
@@ -1736,7 +1849,7 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
         //   而 shellX 已经是 fieldShell 自己的位置 → 整个输入框向右平移了
         //   一遍，右边 34pt 直接跑出卡片外（--layout-check 抓出来的）。
         let inIcon = NSTextField(labelWithString: "⌘")
-        inIcon.font = .systemFont(ofSize: 13, weight: .medium)
+        inIcon.font = uiFont(size: 13, weight: .medium)
         inIcon.textColor = Palette.faint
         inIcon.frame = NSRect(x: 12, y: 12, width: 18, height: 18)
         fieldShell.addSubview(inIcon)
@@ -1744,7 +1857,7 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
         freeInput = NSTextField(frame: NSRect(x: 32, y: 11,
                                              width: shellW - 32 - 14, height: 20))
         freeInput.placeholderString = "打开微信 / 截图 / 录屏 / 打开iKuuuVPN / 帮我写年度总结…"
-        freeInput.font = .systemFont(ofSize: 13)
+        freeInput.font = uiFont(size: 13, weight: .regular)
         freeInput.target = self
         freeInput.action = #selector(submitFree(_:))
         freeInput.isBezeled = false
@@ -1758,7 +1871,7 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
         go.kind = .accent
         go.title = "↑"
         go.symbol = "arrow.up"
-        go.font = .systemFont(ofSize: 15, weight: .bold)
+        go.font = uiFont(size: 15, weight: .bold)
         go.target = self
         go.action = #selector(submitFree(_:))
         go.keyEquivalent = "\r"
@@ -1771,7 +1884,7 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
         wbButton.kind = .ghost
         wbButton.title = "→"
         wbButton.symbol = "arrow.turn.up.right"
-        wbButton.font = .systemFont(ofSize: 14, weight: .medium)
+        wbButton.font = uiFont(size: 14, weight: .medium)
         wbButton.target = self
         wbButton.action = #selector(openWorkBuddy(_:))
         wbButton.toolTip = "转到 WorkBuddy"
@@ -1814,7 +1927,7 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
             let vv = (BootCfg.current[key] as? String) ?? fallback
             f.stringValue = vv
             f.placeholderString = tip
-            f.font = .monospacedSystemFont(ofSize: 11.5, weight: .regular)
+            f.font = monoFont(size: 11.5, weight: .regular)
             f.textColor = Palette.title
             f.isBezeled = false
             f.drawsBackground = false
@@ -1833,7 +1946,7 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
         thBtn.kind = .ghost
         thBtn.title = "主题 · 深色"
         thBtn.symbol = "moon"
-        thBtn.font = .systemFont(ofSize: 11, weight: .medium)
+        thBtn.font = uiFont(size: 11, weight: .medium)
         thBtn.radius = 3
         thBtn.target = self
         thBtn.action = #selector(toggleBootTheme(_:))
@@ -1849,7 +1962,7 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
         apBtn.kind = .ghost
         apBtn.title = "写入并同步"
         apBtn.symbol = "arrow.down.doc"
-        apBtn.font = .systemFont(ofSize: 11, weight: .semibold)
+        apBtn.font = uiFont(size: 11, weight: .semibold)
         apBtn.radius = 3
         apBtn.target = self
         apBtn.action = #selector(applyBootConfig(_:))
@@ -2178,6 +2291,7 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
         refreshSelfCheck()
         startAmbientEffects()
         if watermark == nil { installWatermark() }
+        if noiseLayer == nil { installNoise() }
         startSelfCheckTimer()
         installKeyMonitor()
         startGlobe()
@@ -2291,6 +2405,23 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
         wm.alphaValue = 0.10
         cv.addSubview(wm, positioned: .below, relativeTo: nil)
         watermark = wm
+    }
+
+    /// 装颗粒层：盖在最上层、点击穿透。
+    ///   ⚠ 必须在内容构建完之后加，否则会压在地球/卡片下面看不到。
+    func installNoise() {
+        /* 2026-10-25 01:30 重做后重新打开（ERR-0015 的修复版）。
+           上一版用 `NSColor(patternImage:).setFill() + bounds.fill()` 平铺 ——
+           图案填充用的是**瓦片像素自身的 alpha**（0.5~0.85），外层没有旋钮，
+           于是整块面板变成白噪点雪花屏。
+           现在：瓦片像素只有「纯白 / 全透明」两种，浓度**只**由
+           `NSImage.draw(in:from:operation:fraction:)` 的 fraction 给（0.025）。
+           ⚠ 改浓度就只动 NoiseView.grain 这一个数，别再去碰瓦片像素。 */
+        guard let cv = window?.contentView else { return }
+        let n = NoiseView(frame: cv.bounds)
+        n.autoresizingMask = [.width, .height]
+        cv.addSubview(n, positioned: .above, relativeTo: nil)
+        noiseLayer = n
     }
 
     func startAmbientEffects() {
@@ -2791,6 +2922,86 @@ func runLayoutCheck() -> Int {
     return 1
 }
 
+/// 字体自检：把「用的是哪套字」变成可打印的事实。
+///
+/// 为什么不能只看截图：字体没注册时 uiFont 会**静默回退**到 Avenir Next，
+/// 面板照样画得出来，截图上两者都是"没有衬线的字"，肉眼很难判。
+/// 所以这里直接验证三件事：
+///   ① 字体文件在不在、注册成不成功；
+///   ② `NSFont(name:)` 能不能解析到 PS 名；
+///   ③ 每个方块按钮在 12.5pt 下要多宽 —— 换字体最直接的后果就在这里。
+func runFontCheck() -> Int {
+    var bad = 0
+    print("FONT_DIR \(BundledFonts.dir)")
+    for f in BundledFonts.files {
+        let registered = BundledFonts.ready.contains(f.ps)
+        let resolved = NSFont(name: f.ps, size: 12)?.fontName ?? "nil"
+        if !registered || resolved == "nil" { bad += 1 }
+        print("  \(registered && resolved != "nil" ? "✅" : "❌") \(f.file).ttf → PS \(f.ps) → 解析 \(resolved)")
+    }
+    print("uiFont(12.5,.medium)   = \(uiFont(size: 12.5, weight: .medium).fontName)")
+    print("uiFont(11,.semibold)   = \(uiFont(size: 11, weight: .semibold).fontName)")
+    print("monoFont(9.5,.regular) = \(monoFont(size: 9.5, weight: .regular).fontName)")
+
+    // 方块按钮的实测宽度：同一个"需求宽度"，三个字体横向对照
+    let p = Panel.shared.buildIfNeeded()
+    guard let root = p.window.contentView else {
+        print("FONT_FAIL 没有 contentView")
+        return 1
+    }
+    var tiles: [TileButton] = []
+    func walk(_ v: NSView) {
+        for s in v.subviews {
+            if let b = s as? TileButton, !b.title.isEmpty, b.kind == .tile { tiles.append(b) }
+            walk(s)
+        }
+    }
+    walk(root)
+
+    let inter = uiFont(size: 12.5, weight: .medium)
+    let avenir = NSFont(name: "AvenirNext-DemiBold", size: 12.5)
+        ?? NSFont.systemFont(ofSize: 12.5, weight: .medium)
+    print("TILES \(tiles.count) 个（需求宽度 = 12.5pt 下的文字宽；可用 = 按钮宽 - 24）")
+    for b in tiles {
+        let avail = b.bounds.width - 24
+        let wInter = (b.title as NSString).size(withAttributes: [.font: inter]).width
+        let wAve = (b.title as NSString).size(withAttributes: [.font: avenir]).width
+        let mark = wInter <= avail ? "OK " : "✗  "
+        print(String(format: "  %@「%@」 Inter %5.1f / Avenir %5.1f / 可用 %5.1f  Δ%+.1f",
+                     mark, b.title, wInter, wAve, avail, wInter - wAve))
+        if wInter > avail { bad += 1 }
+    }
+    if bad == 0 {
+        print("FONT_OK \(tiles.count) 个按钮在 Inter 12.5pt 下均未超出可用宽度")
+    }
+
+    // SELF-CHECK 栏：每行是「标签 …… 值」两段右左夹逼，行距是算出来的。
+    // 换字体后行高没变，但**字变宽了**，所以这里只验横向会不会撞车：
+    // 两段之间的空隙小于 6pt 就已经算不上"有空隙"，引导线也画不出来。
+    let snap = Probe.collect()
+    let rows = Probe.items(from: snap)
+    p.selfCheck.items = rows
+    let barW = p.selfCheck.bounds.width
+    let labelF = monoFont(size: 9.5, weight: .regular)
+    let valueF = monoFont(size: 9.5, weight: .medium)
+    print("SELFCHECK \(rows.count) 行 · 栏宽 \(Int(barW))pt")
+    for it in rows {
+        let lw = (it.label as NSString).size(withAttributes: [.font: labelF]).width
+        let vw = (it.value as NSString).size(withAttributes: [.font: valueF]).width
+        let gap = (barW - 12 - vw) - (22 + lw)
+        if gap < 6 { bad += 1 }
+        print(String(format: "  %@ %@ … %@ 空隙 %5.1fpt", gap >= 6 ? "OK " : "✗  ",
+                     it.label, it.value, gap))
+    }
+
+    if bad == 0 {
+        print("FONT_OK \(tiles.count) 个按钮 + \(rows.count) 行自检均未溢出")
+        return 0
+    }
+    print("FONT_FAIL \(bad) 处问题")
+    return 1
+}
+
 // MARK: - 入口
 
 func hotKeyFromArgs() -> (UInt32, UInt32) {
@@ -2863,6 +3074,10 @@ func printHelp() {
 func runMain() {
     let argv = CommandLine.arguments
     if argv.contains("--help") || argv.contains("-h") { printHelp(); exit(0) }
+
+    // ⚠ 字体必须**最先**注册：uiFont / monoFont 都查 BundledFonts.ready，
+    //   晚一步注册，第一批控件就已经用系统字体画完了。
+    BundledFonts.register()
 
     // ── 队列子命令（先于 UI 分支处理）──
     if let qi = argv.firstIndex(of: "queue"), qi + 1 < argv.count {
@@ -2977,6 +3192,14 @@ func runMain() {
     // ── 几何自检（不需要显示窗口，自检脚本会跑）─────────────
     if argv.contains("--layout-check") {
         exit(Int32(runLayoutCheck()))
+    }
+
+    // ── 字体自检：证明「换的字确实生效了」，而不是静默退回系统字体 ──
+    //   为什么需要单独一条：字体缺失时面板照样能画出来（走回退），
+    //   光看截图分不清"Inter"和"回退后的 Avenir" —— 这条会把
+    //   目录、注册结果、实际解析到的 PS 名全部打出来。
+    if argv.contains("--font-check") {
+        exit(Int32(runFontCheck()))
     }
 
     // ── 面板出图（视觉核对用）──────────────────────────────

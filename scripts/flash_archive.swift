@@ -183,7 +183,7 @@ final class ArchiveCard: NSView {
 
     /// 编号：等宽字体、字距拉开、青绿色
     private func drawTag(_ text: String, in r: NSRect) {
-        let font = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
+        let font = monoFont(size: 9, weight: .medium)
         let attrs: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: Palette.accent.withAlphaComponent(0.75),
@@ -713,7 +713,7 @@ func makeMonoLabel(_ text: String, size: CGFloat = 9.5,
                    color: NSColor = Palette.dim,
                    align: NSTextAlignment = .left) -> NSTextField {
     let t = NSTextField(labelWithString: text)
-    t.font = NSFont.monospacedSystemFont(ofSize: size, weight: weight)
+    t.font = monoFont(size: size, weight: weight)
     t.textColor = color
     t.alignment = align
     t.lineBreakMode = .byTruncatingTail
@@ -757,7 +757,7 @@ final class SelfCheckBar: NSView {
 
         // 标题
         let titleAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .semibold),
+            .font: monoFont(size: 9, weight: .semibold),
             .foregroundColor: Palette.accent,
             .kern: 1.8,
         ]
@@ -809,7 +809,7 @@ final class SelfCheckBar: NSView {
                 dash.stroke()
             }
             let waitAttrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedSystemFont(ofSize: 8.5, weight: .regular),
+                .font: monoFont(size: 8.5, weight: .regular),
                 .foregroundColor: Palette.faint,
                 .kern: 0.8,
             ]
@@ -821,7 +821,7 @@ final class SelfCheckBar: NSView {
         }
 
         let keyAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 9.5, weight: .regular),
+            .font: monoFont(size: 9.5, weight: .regular),
             .foregroundColor: Palette.dim,
         ]
         for it in items {
@@ -836,8 +836,8 @@ final class SelfCheckBar: NSView {
             let lw = ls.size(withAttributes: keyAttrs).width
 
             let valAttrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedSystemFont(ofSize: 9.5,
-                                                   weight: it.ok ? .medium : .bold),
+                .font: monoFont(size: 9.5,
+                                weight: it.ok ? .medium : .bold),
                 // 正常值走墨色：参考稿里"一切正常"是沉默的，彩色只留给异常
                 .foregroundColor: it.ok ? Palette.title : Palette.bad,
             ]
@@ -877,7 +877,7 @@ final class SelfCheckBar: NSView {
             line.stroke()
 
             let sAttrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedSystemFont(ofSize: 8.5, weight: .regular),
+                .font: monoFont(size: 8.5, weight: .regular),
                 .foregroundColor: Palette.faint,
                 .kern: 0.6,
             ]
@@ -1045,4 +1045,100 @@ enum Probe {
 ///   ③ 转动极慢（主地球的 1/5 速率）—— 背景动了会抢注意力，几乎静止才对。
 final class GlobeWatermark: GlobeView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+
+/// 颗粒噪点：一层极淡的 1-bit 胶片颗粒，压掉近黑底色带。
+///
+/// 为什么需要：纯色近黑（#0a0a0a）在大面积渐变上会有可见色带（banding），
+/// 尤其面板底板的斜向纹理与卡片之间。加 2.5% 的随机噪点，人眼读到的是"材质"，
+/// 不是"色块"，近黑就有了"纸/金属"的质感。
+///
+/// 三条纪律：
+///   ① 颗粒**只生成一次**并缓存成 96×96 的瓦片，draw 里平铺 —— 每帧随机画点会吃掉 CPU；
+///   ② `hitTest` 返回 nil，盖在最上层但不吃点击；
+///   ③ 透明度 0.025 —— 再高就开始影响小字辨识度。
+final class NoiseView: NSView {
+    private static let tileSide: CGFloat = 96
+    /// 整层浓度：**只**由 `draw(in:from:operation:fraction:)` 的 `fraction` 给。
+    /// 0.025 = 2.5%，这是文档里「再高就开始影响小字辨识度」的上限。
+    private static let grain: CGFloat = 0.025
+    /// 瓦片全局只生成一次（static 懒加载），不随实例/重绘重建。
+    private static let tile: NSImage? = NoiseView.makeTile()
+
+    override var isOpaque: Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // ⚠ 图层化是「不叠影」的前提：View 非图层化时 draw 直接画进窗口的
+        //   共享 backing store，重绘一次就把 2.5% 又叠一遍 → 越刷越浓。
+        //   图层化后每次 draw 都从全透明重来。
+        wantsLayer = true
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) 未实现") }
+
+    private static func makeTile() -> NSImage? {
+        // ⚠⚠ 这里**绝对不能**用 NSImage(size:)+lockFocus（2026-10-25 踩过）：
+        //   lockFocus 会临时替换当前绘图上下文，若此时正处于图层化 View 的
+        //   draw(_:) 里，这一帧的上下文就被顶掉 —— 面板整窗不再合成，
+        //   屏幕上看不见、截图全白。改成显式位图 + NSGraphicsContext(bitmapImageRep:)。
+        let px = Int(tileSide) * 2      // 2x 位图：Retina 上 1 个点 = 2 个像素，颗粒更细
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                         pixelsWide: px, pixelsHigh: px,
+                                         bitsPerSample: 8, samplesPerPixel: 4,
+                                         hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+        memset(rep.bitmapData!, 0, rep.bytesPerRow * px)   // 全透明打底，不靠 clear 填充
+        rep.size = NSSize(width: tileSide, height: tileSide)
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSGraphicsContext.current?.imageInterpolation = .none
+        NSGraphicsContext.current?.shouldAntialias = false
+        // 用固定种子：每次启动的颗粒分布一致，避免"开机像雪花屏在变"
+        var seed: UInt64 = 0x9E3779B97F4A7C15
+        func rnd() -> CGFloat {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            return CGFloat((seed >> 33) & 0xFFFF) / 65535.0
+        }
+        // ⚠ 点必须是**纯白 alpha 1.0**：上一版让点自带 0.5~0.85 的 alpha，
+        //   再交给 pattern fill，等于浓度写死在像素里、外面没法调（ERR-0015）。
+        //   现在像素只有「有/无」，全局浓度 100% 由 draw 的 fraction 决定。
+        NSColor(calibratedWhite: 1.0, alpha: 1.0).setFill()
+        for _ in 0..<(px * px / 3) {
+            NSRect(x: (rnd() * CGFloat(px)).rounded(.down),
+                   y: (rnd() * CGFloat(px)).rounded(.down),
+                   width: 1, height: 1).fill()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        let img = NSImage(size: NSSize(width: tileSide, height: tileSide))
+        img.addRepresentation(rep)
+        return img
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let t = Self.tile else { return }
+        let ctx = NSGraphicsContext.current
+        ctx?.imageInterpolation = .none
+        let side = Self.tileSide
+        let src = NSRect(x: 0, y: 0, width: side, height: side)
+        let b = bounds
+        // 自己平铺：瓦片对齐到 96 的整数倍，保证 resize 时颗粒网格不"抖"。
+        // 每个像素只被覆盖一次，所以合成结果恒为 2.5%，不会因重叠而加浓。
+        var y = (b.minY / side).rounded(.down) * side
+        while y < b.maxY {
+            var x = (b.minX / side).rounded(.down) * side
+            while x < b.maxX {
+                t.draw(in: NSRect(x: x, y: y, width: side, height: side),
+                       from: src,
+                       operation: .sourceOver,
+                       fraction: Self.grain)
+                x += side
+            }
+            y += side
+        }
+    }
 }

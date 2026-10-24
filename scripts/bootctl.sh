@@ -25,7 +25,7 @@
 #   bootctl.sh logs       看日志
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LABEL="com.shankong.wbboot"
+LABEL="com.lingtai.bootanim"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LAUNCHER="$DIR/bootanim/tools/wblaunch"
 LOG="/tmp/wbboot.log"

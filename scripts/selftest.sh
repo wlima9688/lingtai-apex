@@ -616,7 +616,7 @@ else
 fi
 
 # 12.11 开机自启plist 必须存在且合法
-PLIST="$HOME/Library/LaunchAgents/com.shankong.flash.plist"
+PLIST="$HOME/Library/LaunchAgents/com.lingtai.apex.plist"
 if [ -f "$PLIST" ] && plutil -lint "$PLIST" >/dev/null 2>&1; then
   t_ok "开机自启 plist 存在且合法"
 else
@@ -626,13 +626,13 @@ fi
 # 12.12 plist 的 ProgramArguments 必须指向真实的 flash 路径
 # ⚠ 硬编码路径写错是开机自启最常见的失效原因，且平时看不出来
 #   （plist 合法、flash 也能手动跑，只有重启后才发现热键没了）。
-# ⚠ 2026-10-23 起 plist 不再直接跑二进制，而是 `open -g -a 闪控.app`
+# ⚠ 2026-10-23 起 plist 不再直接跑二进制，而是 `open -g -a 灵台智枢.app`
 #   （裸二进制由 shell 拉起时进程会跟着父 shell 被回收 → 用户按热键没反应）。
 #   断言要跟着改成「指向真实存在的启动目标」，否则会把正确的配置判成错的。
 if [ -f "$PLIST" ] \
    && { grep -q "skills/mac-control/scripts/flash" "$PLIST" \
-        || { grep -q "灵台智枢.app" "$PLIST" && [ -d "$DIR/闪控.app" ]; }; }; then
-  t_ok "plist 指向真实存在的启动目标（flash 二进制或 闪控.app）"
+        || { grep -q "灵台智枢.app" "$PLIST" && [ -d "$DIR/灵台智枢.app" ]; }; }; then
+  t_ok "plist 指向真实存在的启动目标（flash 二进制或 灵台智枢.app）"
 else
   t_fail "plist 里的 flash 路径不对 —— 重启后热键会失效"
 fi
@@ -2238,7 +2238,7 @@ fi
 # 20.11 开机动画自启注册命令必须存在（2026-10-22 翻车根因：
 #   plist 躺在磁盘上从没被 bootstrap，重启后动画根本不弹，日志文件都不存在）
 if grep -q 'install-boot)' "$DIR/flashctl.sh" \
-   && grep -q 'com.shankong.wbboot' "$DIR/flashctl.sh"; then
+   && grep -q 'com.lingtai.bootanim' "$DIR/flashctl.sh"; then
   t_ok "flashctl.sh install-boot 在位（开机动画自启可一键注册）"
 else
   t_fail "没有 install-boot —— 开机动画没法可靠注册（踩过的坑会复发）"
@@ -2645,9 +2645,9 @@ else
 fi
 
 # 22.7 可双击的 .app 外壳（登录项只收 .app，裸二进制进不去）
-if [ -f "$DIR/闪控.app/Contents/Info.plist" ] \
-   && grep -q "LSUIElement" "$DIR/闪控.app/Contents/Info.plist"; then
-  t_ok "闪控.app 外壳在位（可双击启动、可进登录项；壳里 exec 原二进制，不换 TCC 身份）"
+if [ -f "$DIR/灵台智枢.app/Contents/Info.plist" ] \
+   && grep -q "LSUIElement" "$DIR/灵台智枢.app/Contents/Info.plist"; then
+  t_ok "灵台智枢.app 外壳在位（可双击启动、可进登录项；壳里 exec 原二进制，不换 TCC 身份）"
 else
   t_fail "缺 .app 外壳 —— 用户只能靠命令行启动，登录项也选不到它"
 fi
@@ -2689,16 +2689,16 @@ else
   t_fail "flash 是 ad-hoc 签名（指定要求=cdhash）—— 每次重编译都要用户重新授权"
 fi
 
-# 23.4 运行实例必须真是「闪控.app」（不是被 shell 壳 exec 掉的裸二进制）
+# 23.4 运行实例必须真是「灵台智枢.app」（不是被 shell 壳 exec 掉的裸二进制）
 #   ⚠ 这个坑很隐蔽：bundle 里留着旧版的 Contents/MacOS/run 时，LaunchServices
 #   会执行 run → run 再 exec 外部裸二进制 → Bundle.main 变 nil → TCC 看到的是
 #   "裸二进制"，用户把 app 拖进辅助功能也永远不生效（实测 ax 一直 0）。
-if [ -f "$DIR/闪控.app/Contents/MacOS/run" ]; then
-  t_fail "闪控.app 里还留着旧的 shell 壳 run —— 会把进程 exec 成裸二进制，app 授权永远不生效"
-elif [ -x "$DIR/闪控.app/Contents/MacOS/flash" ]; then
-  t_ok "闪控.app 的主可执行是它自己的二进制副本（bundle 身份成立，TCC 授权可绑定）"
+if [ -f "$DIR/灵台智枢.app/Contents/MacOS/run" ]; then
+  t_fail "灵台智枢.app 里还留着旧的 shell 壳 run —— 会把进程 exec 成裸二进制，app 授权永远不生效"
+elif [ -x "$DIR/灵台智枢.app/Contents/MacOS/flash" ]; then
+  t_ok "灵台智枢.app 的主可执行是它自己的二进制副本（bundle 身份成立，TCC 授权可绑定）"
 else
-  t_fail "闪控.app 缺主可执行"
+  t_fail "灵台智枢.app 缺主可执行"
 fi
 
 # 23.5 热键必须双通道 + 备用键，且 plist 必须 KeepAlive

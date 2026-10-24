@@ -38,28 +38,60 @@ launch_app() {   # $1=显示名  $2=路径
   fi
 }
 
+# 后台启动并隐藏：open -g 不抢焦点；再把它藏起来（相当于 ⌘H）。
+# 为什么不用 "open 后最小化窗口"：四个 App 的窗口结构各不相同（Electron / 原生 / 微信），
+# 逐个最小化窗口要写四套 AX 逻辑；"整应用隐藏"是唯一对所有 App 都成立的做法。
+launch_hidden() {
+  local name="$1" path="$2" proc="$3"
+  [ -e "$path" ] || { log "跳过 $name（不存在：$path）"; return 1; }
+  if /usr/bin/open -g -a "$path" >>"$LOG" 2>&1; then
+    log "已拉起 $name（后台）"
+  else
+    log "⚠️ 拉起失败 $name"; return 1
+  fi
+  for _ in 1 2 3 4 5 6; do
+    sleep 1
+    if osascript -e "tell application \"System Events\" to set visible of process \"$proc\" to false" >>"$LOG" 2>&1; then
+      log "已隐藏 $name"; return 0
+    fi
+  done
+  log "⚠️ $name 起来了但隐藏失败（可能进程名不是「$proc」）"
+}
+
 finished=0
 finish() {
   [ "$finished" = "1" ] && return 0
   finished=1
-  log "--- 动画阶段结束，开始拉起其他自启项 ---"
+  log "--- 动画阶段结束，开始按序拉起 5 个自启项 ---"
 
-  # ① 灵台智枢：走 LaunchAgent（KeepAlive 由 launchd 托管），失败退回 open
-  if ! launchctl kickstart -k "gui/$(id -u)/com.shankong.flash" >>"$LOG" 2>&1; then
+  # 启动规则（用户 2026-10-25 拍板）：
+  #   · 只有这 5 个：灵台智枢 / 微信 / DSH / WorkBuddy / 豆包
+  #   · 动画最高优先级，播完才拉起它们
+  #   · 只有 DSH 允许出现在前台；其余四个起来后都隐藏
+
+  # ① 灵台智枢（面板本身常驻，无 Dock 图标，面板默认不显示 → 天然"最小化"）
+  if ! launchctl kickstart -k "gui/$(id -u)/com.lingtai.apex" >>"$LOG" 2>&1; then
     log "kickstart 失败，改用 open"
-    launch_app "灵台智枢" "/Applications/灵台智枢.app"
+    /usr/bin/open -g -a "/Applications/灵台智枢.app" >>"$LOG" 2>&1
   else
     log "已拉起 灵台智枢（launchd）"
   fi
 
-  # ② DeepSeek Harness（天公）—— 新增开机自启
-  launch_app "DeepSeek Harness" "/Applications/DeepSeek Harness.app"
+  # ② 微信 / ③ WorkBuddy / ④ 豆包 —— 后台起，不抢焦点，起来后隐藏
+  launch_hidden "微信"        "/Applications/WeChat.app"        "微信"
+  launch_hidden "WorkBuddy"   "/Applications/WorkBuddy.app"     "WorkBuddy"
+  launch_hidden "豆包"        "/Applications/Doubao.app"        "Doubao"
 
-  # ③ Cherry Studio（本来就是登录项，改由这里按序拉起）
-  launch_app "Cherry Studio" "/Applications/Cherry Studio.app"
+  # ⑤ DSH 最后起、且**唯一允许在前台**：它是用户开机后真正要看的那一屏
+  if /usr/bin/open -a "/Applications/DeepSeek Harness.app" >>"$LOG" 2>&1; then
+    log "已拉起 DeepSeek Harness（前台）"
+  else
+    log "⚠️ DeepSeek Harness 拉起失败"
+  fi
+  sleep 1
+  osascript -e 'tell application "System Events" to set frontmost of process "DeepSeek Harness" to true' >>"$LOG" 2>&1 \
+    || log "⚠️ DSH 置前失败（不影响启动）"
 
-  # ④ WorkBuddy **不拉起**（用户拍板：需要时再启动）
-  log "WorkBuddy 按设定不自启"
   log "=== 开机顺序总控结束 ==="
 }
 trap finish EXIT INT TERM

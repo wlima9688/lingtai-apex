@@ -250,7 +250,21 @@ final class Splash: NSObject, WKNavigationDelegate {
         fullFrame = fr
         super.init()
         web.navigationDelegate = self
-        win.contentView = web
+        /* ⚠⚠⚠ 白屏真因（2026-10-25 01:10 终于定位对）：
+           `win.contentView = web` 意味着 **WebView 自己就是内容视图**。
+           WKWebView 在首绘之前会绘制**自身底色（白）**，此时窗口底色
+           （win.backgroundColor）根本露不出来 —— 所以上一版改窗口底色无效，
+           用户重启后照样"闪一下白"。
+           正确做法：窗口内容换成一个**近黑容器**，WebView 以 alpha=0 叠在上面，
+           页面 didFinish 之后再淡入。首绘前用户看到的是容器底色（近黑），
+           页面背景本身也是 #08090a，淡入时没有任何色阶跳变。 */
+        let container = NSView(frame: fr)
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor(calibratedWhite: 0.03, alpha: 1).cgColor
+        web.frame = container.bounds
+        web.alphaValue = 0
+        container.addSubview(web)
+        win.contentView = container
         win.backgroundColor = NSColor(calibratedWhite: 0.03, alpha: 1)
         win.isOpaque = true
         win.hasShadow = false       // 全屏窗口的阴影永远不可见，省一次合成
@@ -269,7 +283,20 @@ final class Splash: NSObject, WKNavigationDelegate {
         win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
     }
 
+    /// 页面已就绪 → 把 WebView 淡入（首绘前的近黑容器正好接住这一帧）
+    private func revealWeb(after delay: Double = 0.15) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self, self.web.alphaValue < 1 else { return }
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.25
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                self.web.animator().alphaValue = 1
+            }
+        }
+    }
+
     func webView(_ v: WKWebView, didFinish n: WKNavigation!) {
+        revealWeb()
         // 调试：确认页面**真的**收到了注入配置（宿主自己 dict 里有不等于页面有）
         if ProcessInfo.processInfo.environment["WB_LAUNCH_DEBUG"] != nil {
             let js = "(function(){var c=window.__WB_BOOT_CONFIG__;" +
@@ -502,7 +529,7 @@ if cmd == "probe" {
 // ── boot 模式：开机自启动场景 ──────────────────────────────────────────────
 // 场景：launchd 在用户登录时同时拉起两个东西 ——
 //   ① WorkBuddy 自己（它用 SMAppService 注册的登录项，系统直接放行，拦不住）
-//   ② 我们的 wblaunch（LaunchAgent com.shankong.wbboot）
+//   ② 我们的 wblaunch（LaunchAgent com.lingtai.bootanim）
 // 两者赛跑：谁先起来是不确定的。
 //   - 如果 WorkBuddy 先起来 → 我们的动画**仍然要播**（用户明确要求开机时播），
 //     只是不能再重复拉起 WorkBuddy。
