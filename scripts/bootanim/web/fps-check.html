@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>fps meter（临时帧率实验页，验完即删）</title>
+<link rel="stylesheet" href="splash.css">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  /* 与真机 wblaunch 一致：全屏尺寸由窗口决定，星体用标准 170px */
+  #fps {
+    position: fixed; left: 8px; top: 8px; z-index: 999;
+    font: 12px/1.4 ui-monospace, Menlo, monospace; color: #0f0;
+    background: rgba(0,0,0,.7); padding: 4px 8px; border-radius: 4px;
+    white-space: pre; pointer-events: none;
+  }
+  /* 实验开关：#nofilter 去掉星体 drop-shadow（辉光改静态径向渐变已内置） */
+  body.nofilter .dsu-black .dsu-whale { filter: none !important; }
+  /* #nocanvas 停掉背景粒子场 */
+</style>
+</head>
+<body>
+<div id="fps">measuring…</div>
+<script>
+  window.__WB_BRAND_PATH__ = null;
+  /* URL hash 实验开关：#nofilter / #nocanvas */
+  window.__EXP__ = (location.hash || '').replace('#', '').split(',');
+</script>
+<script src="brand.js"></script>
+<script>
+  window.__WB_BOOT_CONFIG__ = {
+    enabled: true, mode: 'always', theme: 'dark', speed: 1,
+    requireInteraction: false, sceneGate: true, gateTimeoutMs: 3000, allowSkip: true,
+    sound: true, soundVolume: 0.45, voice: false,
+    identity: '温昼', identityId: 'LS-WZ-0961-01',
+    brand1: 'WORKBUDDY', brand2: 'SYNTHESIZE INTELLIGENCE',
+    brand3a: 'HARNESS', brand3b: 'OS',
+    orgZh: '方寸山矩阵终端', orgEn: 'WORKBUDDY', orgSub: 'WORKBUDDY HARNESS',
+    welcomeBox: 'WORKBUDDY HARNESS', footer: 'POWERED BY WORKBUDDY',
+    facts: { ready: true, profile: 'WORKBUDDY', version: '5.8.3', model: 'HARNESS', sandbox: 'LOCAL', plugins: 4, bundleCount: 12, workspace: 'mac-control' }
+  };
+  window.__WB_BOOT_VERSION__ = '1';
+</script>
+<script src="splash.js"></script>
+<script>
+(function () {
+  var exp = window.__EXP__ || [];
+  if (exp.indexOf('nofilter') >= 0) document.body.className = 'nofilter';
+  if (exp.indexOf('nocanvas') >= 0) {
+    var t = setInterval(function () {
+      var f = window.__DSH_STARTUP_FIELD__;
+      if (f) { clearInterval(t); f.stop(); }
+    }, 50);
+  }
+  /* 整页合成帧率：rAF 时间戳间隔统计（含 SVG 重绘/filter 的掉帧） */
+  var last = 0, n = 0, sum = 0, worst = 0, t0 = 0;
+  var box = document.getElementById('fps');
+  var REPORTED = false;
+  var samples = [];
+  /* 每 5 秒报一次分段（定位哪个场景开始掉帧），全程结束再报总分 */
+  function report(tag) {
+    if (n < 5) return;
+    var sorted = samples.slice().sort(function (a, b) { return a - b; });
+    var avg = sum / n;
+    var p50 = sorted[Math.floor(sorted.length * 0.5)] || 0;
+    var p95 = sorted[Math.floor(sorted.length * 0.95)] || 0;
+    var line = 'FPSRESULT[' + tag + '] exp=[' + (exp.join(',') || 'none') + ']' +
+      ' fps=' + (1000 / avg).toFixed(1) +
+      ' p50=' + p50.toFixed(1) + 'ms' +
+      ' p95=' + p95.toFixed(1) + 'ms' +
+      ' worst=' + worst.toFixed(0) + 'ms' +
+      ' n=' + n + ' dpr=' + window.devicePixelRatio +
+      ' canvas=' + (window.__DSH_STARTUP_FIELD__ ? (window.__DSH_STARTUP_FIELD__.width() + 'x' + window.__DSH_STARTUP_FIELD__.height()) : 'off');
+    console.log(line);
+    box.textContent = line;
+  }
+  var lastSeg = 0;
+  function tick(ts) {
+    if (!t0) t0 = ts;
+    if (last) {
+      var d = ts - last;
+      samples.push(d);
+      sum += d; n++;
+      if (n > 3 && d > worst) worst = d;
+    }
+    last = ts;
+    if (n && n % 30 === 0) {
+      report('live');
+    }
+    if (ts - t0 > 5000 && ts - t0 - lastSeg >= 5000) {
+      lastSeg = ts - t0;
+      report('seg@' + Math.round(lastSeg / 1000) + 's');
+    }
+    /* 动画播完（root 被移除）→ 总分报告；probehtml bridge 收进 __LOGS__ 回显 */
+    if (!REPORTED && !document.getElementById('dsh-startup-root')) {
+      REPORTED = true;
+      report('FINAL');
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>

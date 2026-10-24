@@ -1,0 +1,104 @@
+{
+  "name": "mac-control",
+  "version": "1.9.0",
+  "displayName": "闪控",
+  "description": "闪控 —— macOS 桌面操控的两层架构：意图层（一句话 → 1 次工具调用完成整件事，脚本内部自验证并返回结构化 JSON）+ 控制层（macctl 原子命令）。说「开音乐」「打开 XX 文件」「刷抖音」「给 XX 发微信说 YY」等日常指令时直接调脚本，不要逐步指挥点击。",
+  "author": "WorkBuddy",
+  "license": "MIT",
+  "keywords": [
+    "macos",
+    "automation",
+    "desktop-control",
+    "gui-automation",
+    "accessibility",
+    "ax",
+    "screen-capture",
+    "intent-router",
+    "reflex",
+    "fast-path",
+    "mac-control",
+    "闪控"
+  ],
+  "entry": "SKILL.md",
+  "layers": {
+    "intent": {
+      "description": "意图层：把一句话路由到脚本，1 次调用完成整件事",
+      "scripts": {
+        "music_play": "scripts/music_play.sh",
+        "open_file": "scripts/open_file.sh",
+        "douyin_open": "scripts/douyin_open.sh",
+        "wechat_send": "scripts/wechat_send.sh"
+      }
+    },
+    "control": {
+      "description": "控制层：macctl 原子命令（AX 查询/点击/输入/截图/条件等待/环境体检）",
+      "binary": "scripts/macctl",
+      "source": "scripts/macctl.swift"
+    }
+  },
+  "scripts": {
+    "macctl": "scripts/macctl",
+    "music_play": "scripts/music_play.sh",
+    "open_file": "scripts/open_file.sh",
+    "douyin_open": "scripts/douyin_open.sh",
+    "wechat_send": "scripts/wechat_send.sh",
+    "lint": "scripts/lint.sh",
+    "selftest": "scripts/selftest.sh",
+    "bench": "scripts/bench.sh",
+    "route": "scripts/route.sh",
+    "flash": "scripts/flash",
+    "flashctl": "scripts/flashctl.sh"
+  },
+  "state": {
+    "preferences": "preferences.md",
+    "proposals": "proposals.jsonl",
+    "learned": "cache/learned.json",
+    "logs": "logs/"
+  },
+  "references": [
+    "DIAGNOSIS.md",
+    "CHANGELOG.md",
+    "UPGRADE.md",
+    "references/engineering-rules.md",
+    "references/troubleshooting.md",
+    "references/patterns.md",
+    "references/permissions.md",
+    "references/locator-ladder.md",
+    "references/open-source-lessons.md"
+  ],
+  "requirements": {
+    "os": "macOS 13+",
+    "shell": "bash 3.2+",
+    "tools": [
+      "python3",
+      "swiftc",
+      "mdfind"
+    ],
+    "permissions": [
+      "Accessibility",
+      "ScreenCapture",
+      "InputMonitoring",
+      "Automation"
+    ]
+  },
+  "guarantees": {
+    "silent": "所有脚本执行期间强制静音，绝不发出声音，退出时自动恢复原状态",
+    "maxModelCalls": 1,
+    "maxModelCallsL1": 2
+  },
+  "notes": {
+    "merge": "本技能由原 mac-control（控制层）与 mac-reflex（意图层）于 2026-10-21 融合而成。英文名沿用 mac-control（工具名与二进制不变，避免破坏既有调用），中文名「闪控」。"
+  },
+  "docs": {
+    "USAGE.md": "用户使用说明（v1.7）"
+  },
+  "media": {
+    "dir": "~/Desktop/闪控",
+    "note": "截图与录屏统一落在此目录，文件名格式：<类型>-YYYY年MM月DD日-HH时mm分ss秒.<扩展名>（月日时分秒补零，按文件名排序即按时间排序）",
+    "naming": [
+      "截图-2026年10月22日-02时18分30秒.png",
+      "截图-选区-...png",
+      "录屏-2026年10月22日-02时18分30秒.mov"
+    ]
+  }
+}

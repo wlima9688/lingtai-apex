@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>macOS 启动动画 · 预览</title>
+<link rel="stylesheet" href="splash.css">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  /* 幕后假背景：揭幕那刻要有东西可看 */
+  #mock { position: fixed; inset: 0; z-index: 1; background: #f7f7f5; display: flex; }
+  #mock .side { width: 220px; background: #efeff0; border-right: 1px solid #e2e2e0; padding: 16px 12px; }
+  #mock .side div { font-size: 13px; color: #55565a; padding: 8px 9px; }
+  #mock .side div.on { background: #fff; color: #1d1d1f; border-radius: 8px; }
+  #mock .main { flex: 1; padding: 30px 36px; }
+  #mock .b { max-width: 560px; font-size: 13.5px; line-height: 1.75; color: #2c2d31; }
+</style>
+</head>
+<body>
+<div id="mock">
+  <div class="side">
+    <div class="on">新对话</div><div>工作台</div><div>资料库</div><div>专家</div><div>设置</div>
+  </div>
+  <div class="main"><div class="b">macOS 主界面（揭幕后可见）</div></div>
+</div>
+
+<script>
+  // 品牌标识：独立文件，便于单独预览与替换
+  window.__WB_BRAND_PATH__ = null;
+</script>
+<script src="brand.js"></script>
+<script>
+  // 运行时配置。⚠ 移植后不再有 DSH 的 Host 侧，配置由启动器注入。
+  window.__WB_BOOT_CONFIG__ = {
+    enabled: true,
+    mode: 'always',
+    theme: 'dark',
+    speed: 1,
+    requireInteraction: false,
+    allowSkip: true,
+    sound: true,
+    soundVolume: 0.5,
+    voice: true,
+    identity: '温昼',
+    identityId: 'LS-WZ-0961-01',
+    brand1: 'MacOS',
+    brand2: 'BUILT ON APPLE SILICON',
+    brand3a: 'SYSTEM',
+    brand3b: 'ASSISTANT',
+    orgZh: '方寸山矩阵终端',
+    orgEn: 'MacOS',
+    orgSub: 'APPLE SYSTEM ASSISTANT',
+    welcomeBox: 'MacOS',
+    footer: 'DESIGNED BY APPLE IN CALIFORNIA',
+    facts: { ready: true, profile: 'MacOS', version: '5.8.3', model: 'APPLE SILICON', sandbox: 'LOCAL', plugins: 4, bundleCount: 12, workspace: 'mac-control' }
+  };
+  window.__WB_BOOT_VERSION__ = '1';
+</script>
+<script src="splash.js"></script>
+</body>
+</html>

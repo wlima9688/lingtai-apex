@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>WorkBuddy</title>
+<!--
+  index.html —— 启动器入口页
+
+  与 preview.html 的区别（别混用）：
+  · preview.html  自带 mock 主界面背景，用来在浏览器里单独调动画
+  · index.html     纯黑底，不带任何 mock —— 启动器里这页是全屏 WKWebView，
+                   动画播完由 Swift 侧 open WorkBuddy 接管真实界面，
+                   所以这里露出的任何"假背景"都会在揭幕瞬间被换掉 = 闪一下。
+
+  配置由启动器用 WKUserScript 在 atDocumentStart 注入（window.__WB_BOOT_CONFIG__）。
+  ⚠ 注入必须早于 splash.js 执行 —— splash.js 是同步 IIFE，配置晚一步就静默退回默认值。
+-->
+<link rel="stylesheet" href="splash.css">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #08090a; }
+  /* 动画期间禁止选中/右键：它是"过场"，不是可以交互的页面 */
+  body { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+</style>
+</head>
+<body>
+<script src="brand.js"></script>
+<script src="splash.js"></script>
+</body>
+</html>
