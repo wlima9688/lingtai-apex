@@ -335,7 +335,7 @@ if [ "$ALREADY" != "yes" ]; then
 
   if [ "$FOCUSED" = "0" ]; then
     # ③ ⌘F 原生快捷键
-    m key --key f --cmd >/dev/null 2>&1
+    m key --key f --cmd --require-front "$BUNDLE" >/dev/null 2>&1
     sleep 0.8
     m clear --app "$BUNDLE" >/dev/null 2>&1
     m type --text "$TO" --app "$BUNDLE" >/dev/null 2>&1
@@ -530,7 +530,7 @@ send_attempt() {
   #   实测必须走剪贴板粘贴（跟酷狗同一个坑）。失败时再退回 type。
   printf '%s' "$MSG" | /usr/bin/pbcopy
   sleep 0.25
-  m key --key v --cmd >/dev/null 2>&1
+  m key --key v --cmd --require-front "$BUNDLE" >/dev/null 2>&1
   sleep 0.8
   if ! m ocr --app "$BUNDLE" 2>/dev/null | /usr/bin/grep -qF "$MSG"; then
     m type --text "$MSG" --app "$BUNDLE" >/dev/null 2>&1
@@ -546,7 +546,7 @@ send_attempt() {
   if ! printf '%s' "$_OCR" | /usr/bin/grep -qF "$MSG"; then
     return 1
   fi
-  m key --key return >/dev/null 2>&1     # 微信：回车即发送
+  m key --key return --require-front "$BUNDLE" >/dev/null 2>&1     # 微信：回车即发送
   sleep 1.6
   return 0
 }

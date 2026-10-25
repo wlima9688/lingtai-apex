@@ -144,7 +144,7 @@ if best: print('%d,%d,%d,%d' % best)
   local wx wy ww wh
   IFS=, read -r wx wy ww wh <<< "$win"
 
-  m key --key esc >/dev/null 2>&1          # 关冷启动的活动/VIP 弹层
+  m key --key esc --require-front "$BUNDLE" >/dev/null 2>&1          # 关冷启动的活动/VIP 弹层
   sleep 0.6
 
   # ⚠⚠ 冷启动时窗口"存在"不等于"首页就绪"：AV 探针一有窗口就返回 true，
@@ -155,7 +155,7 @@ if best: print('%d,%d,%d,%d' % best)
     if m ocr --rect "$wx,$wy,$ww,120" 2>/dev/null | /usr/bin/grep -qE "推荐|乐库|听书"; then
       ready=1; break
     fi
-    m key --key esc >/dev/null 2>&1
+    m key --key esc --require-front "$BUNDLE" >/dev/null 2>&1
     sleep 1
   done
   echo "[vp] ready=$ready" >> /tmp/vp.log
@@ -173,7 +173,7 @@ if best: print('%d,%d,%d,%d' % best)
     sleep 0.5
     printf '%s' "$song" | /usr/bin/pbcopy
     sleep 0.25
-    m key --key v --cmd >/dev/null 2>&1
+    m key --key v --cmd --require-front "$BUNDLE" >/dev/null 2>&1
     sleep 1.0
 
     for attempt in 1 2 3; do
@@ -243,7 +243,7 @@ if [ -z "$SEARCH_XY" ]; then
   #   然后重新跑一遍本脚本 —— 这次 AX 路径就能正常定位并播放。
   #   实测：预热约 6 秒 + 第二遍约 12 秒，全程不花 token，比转交更确定。
   if [ "${MUSIC_PRIMED:-0}" != "1" ]; then
-    m key --key esc >/dev/null 2>&1
+    m key --key esc --require-front "$BUNDLE" >/dev/null 2>&1
     sleep 0.4
     # 搜索框固定在工具栏右侧：0.755×宽，距顶 46
     local win2 wx2 wy2 ww2 wh2
@@ -263,11 +263,11 @@ if best: print('%d,%d,%d,%d' % best)
       sleep 0.6
       printf '%s' "$SONG" | /usr/bin/pbcopy
       sleep 0.25
-      m key --key v --cmd >/dev/null 2>&1
+      m key --key v --cmd --require-front "$BUNDLE" >/dev/null 2>&1
       sleep 0.8
-      m key --key return >/dev/null 2>&1
+      m key --key return --require-front "$BUNDLE" >/dev/null 2>&1
       sleep 1.6
-      m key --key return >/dev/null 2>&1
+      m key --key return --require-front "$BUNDLE" >/dev/null 2>&1
       sleep 2.4
       audit "music_play:$SONG" "music_play.sh" "$LEVEL_L0" "info" "" "已预热搜索页，重试"
       MUSIC_PRIMED=1 exec "$0" --song "$SONG"

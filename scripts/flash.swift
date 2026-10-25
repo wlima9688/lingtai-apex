@@ -721,6 +721,11 @@ func writeHotKeyState(note: String = "") {
     //   app 身份可能没有，表现就是「热键能按（Carbon 不需要授权），但事件监听
     //   装不上、合成按键测不了」。不写这一位，就只能靠猜。
     let ax = AXIsProcessTrusted() ? 1 : 0
+    // rec 要一起记（P13）：屏幕录制有没有授权，是**这个进程身份**下的真相。
+    //   录屏（screencapture -v）从 launchd 会被拒、必须有一次人工勾选，
+    //   `flashctl.sh rec` 靠这一位做守卫 —— 已经是 1 就绝不 tccutil reset（那会清掉好授权）。
+    //   ⚠ 这里只**读**不申请（CGPreflightScreenCaptureAccess 不弹窗）。
+    let rec = CGPreflightScreenCaptureAccess() ? 1 : 0
     // exe/bid 要一起记：TCC 是按「可执行文件 + 签名 + 负责进程」判定的，
     // 排查授权不生效时，第一件要确认的就是"到底跑的是哪个可执行文件"。
     let exe = (Bundle.main.executablePath as NSString?)?.lastPathComponent ?? "?"
@@ -728,7 +733,7 @@ func writeHotKeyState(note: String = "") {
     let bp = Bundle.main.bundlePath
     // sd = 实际解析出来的脚本目录（排查"按钮点了没反应"时第一个要看的东西）
     let sd = scriptsDir()
-    let body = "pid=\(getpid()) carbon=\(carbon) tap=\(tap) ax=\(ax) sd=\(sd) " +
+    let body = "pid=\(getpid()) carbon=\(carbon) tap=\(tap) ax=\(ax) rec=\(rec) sd=\(sd) " +
                "exe=\(exe) bid=\(bid) bp=\(bp) fires=\(gHotKeyFires) " +
                "key=\(gTapKey) note=\(note) at=\(Int(Date().timeIntervalSince1970))\n"
     try? body.write(toFile: path, atomically: true, encoding: .utf8)
@@ -2177,17 +2182,20 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
         RunLoop.current.run(until: Date().addingTimeInterval(0.4))
         if target == "doubao" {
             // 豆包可能停在订阅记录/菜单；先 Esc，再开新对话，输入框才稳定
-            _ = runProcess(macctl, ["key", "--key", "esc"])
+            // ⚠ 每个发事件的调用都要带 --require-front <bundle>（ERR-0024：
+            //   没校验前台就把字打进了微信。macctl 侧现在无 --app 就拒发，
+            //   这里显式声明"要校验的就是刚置前的那个 App"）。
+            _ = runProcess(macctl, ["key", "--key", "esc", "--require-front", bundle])
             RunLoop.current.run(until: Date().addingTimeInterval(0.3))
-            _ = runProcess(macctl, ["tap-text", "--text", "新对话"])
+            _ = runProcess(macctl, ["tap-text", "--text", "新对话", "--require-front", bundle])
             RunLoop.current.run(until: Date().addingTimeInterval(0.5))
         }
         if target == "tiangong" {
             // DSH 激活后输入框不一定有焦点；先点一下「发消息」占位
-            _ = runProcess(macctl, ["tap-text", "--text", "发消息"])
+            _ = runProcess(macctl, ["tap-text", "--text", "发消息", "--require-front", bundle])
             RunLoop.current.run(until: Date().addingTimeInterval(0.4))
         }
-        let code = runProcess(macctl, ["type", "--text", text])
+        let code = runProcess(macctl, ["type", "--text", text, "--require-front", bundle])
         statusLabel.textColor = code == 0 ? Palette.ok : Palette.warn
         statusLabel.stringValue = code == 0
             ? "已粘贴到 \(name) · 检查后发送"
@@ -3465,6 +3473,9 @@ func runMain() {
             print("  \(f): \(FileManager.default.isReadableFile(atPath: p) ? "✅" : "❌ 缺失")")
         }
         print("  辅助功能: \(AXIsProcessTrusted() ? "✅ 已授权" : "❌ 未授权（面板打字/鼠标会静默失效）")")
+        // 录屏授权（P13）：截图不需要授权，但 `screencapture -v` 必须有这一项。
+        //   只读不申请 —— 想修就跑 `flashctl.sh rec`（或桌面「修复屏幕录制授权.command」）。
+        print("  屏幕录制: \(CGPreflightScreenCaptureAccess() ? "✅ 已授权（录屏可用）" : "❌ 未授权（录屏会失败；跑 flashctl.sh rec 修）")")
         print("  队列目录: \(queueDir())")
         print("  待确认项: \(loadPending().count)")
         print("  媒体目录: \(Palette.mediaDir)")
@@ -3519,6 +3530,21 @@ func runMain() {
     if ProcessInfo.processInfo.environment["SHANKONG_AX_PROMPT"] == "1", !AXIsProcessTrusted() {
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
         _ = AXIsProcessTrustedWithOptions(opts as CFDictionary)
+    }
+
+    // ── 屏幕录制授权：**同样绝不自动弹**，只在显式要求时申请一次 ──────
+    // ⚠ 背景：截图已彻底免授权（走 launchd 的 mediacap，ERR-0022），但
+    //   `screencapture -v`（录屏）从 launchd 会被拒（capture error「这项操作无法完成」）
+    //   → 视频**必须**有一次「屏幕录制」勾选。这一步做成一键：`flashctl.sh rec`
+    //   （桌面「修复屏幕录制授权.command」也调它）给 LaunchAgent 临时注入
+    //   LINGTAI_REC_PROMPT=1 → 由 **launchd 拉起**本进程申请一次 → 用户勾 → 撤变量。
+    //   TCC 记的才是「灵台智枢.app」而不是终端。
+    // ⚠ 平时（变量不存在）**一行都不许执行** —— 自动弹窗已经被投诉过（ERR-0023）。
+    //   已授权时也不申请：CGRequestScreenCaptureAccess 在已授权时虽会静默返回 true，
+    //   但"不执行"比"执行了刚好没弹"更容易审计，所以先 preflight 再决定。
+    if ProcessInfo.processInfo.environment["LINGTAI_REC_PROMPT"] == "1",
+       !CGPreflightScreenCaptureAccess() {
+        _ = CGRequestScreenCaptureAccess()   // 只在显式要求时弹一次
     }
 
     // ── 单实例锁 ────────────────────────────────────────────────

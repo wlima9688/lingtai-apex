@@ -349,7 +349,7 @@ func handoffByCoordinates(_ text: String, skill: String? = nil, submit: Bool = t
 
     // ⑤ 提交
     if submit {
-        _ = run(macctl, ["key", "--key", "return"])
+        _ = run(macctl, ["key", "--key", "return", "--require-front", bid])
         RunLoop.current.run(until: Date().addingTimeInterval(0.5))
         r.step = "COORD_SENT"
     }

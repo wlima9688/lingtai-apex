@@ -102,3 +102,45 @@ codesign -d -r- ~/.workbuddy/skills/mac-control/scripts/flash
   打开目录时再取。（2026-10-23 用户投诉的直接原因）
 - **不许在启动时主动弹授权框**。缺权限只降级；需要授权时由人跑
   `flashctl.sh ax`。
+
+## 屏幕录制：只给「录视频」用，一次性修（`flashctl.sh rec`）
+
+先分清两件事（这是最常见的误解）：
+
+| 动作 | 需要「屏幕录制」授权吗 | 走哪条路 |
+|---|---|---|
+| 截图（`shot` / `scan` / 面板截图） | **不需要** | launchd 的 `com.lingtai.mediacap`（ERR-0022） |
+| 录视频（`screencapture -v`） | **需要**，且必须有这一次勾选 | 直接从 launchd 拉起 → 没授权就被拒 |
+
+没授权时的真实报错：`capture error`「这项操作无法完成」，或文件 0 字节 / 只有一帧。
+
+**一键修**（桌面 `修复屏幕录制授权.command` 调的就是它）：
+
+```bash
+~/.workbuddy/skills/mac-control/scripts/flashctl.sh rec
+```
+
+五步，和 `ax)` 逐字同构：
+
+1. **守卫**：`/tmp/flash.hotkey` 里 `rec=1` → 直接退出，**什么都不做**
+   （这一步很关键：后面第一件事就是 `tccutil reset`，会把好授权清掉）；
+2. `tccutil reset ScreenCapture com.lingtai.apex`（清僵尸条目）；
+3. 给 LaunchAgent **临时**注入 `LINGTAI_REC_PROMPT=1`，`bootout/bootstrap/kickstart`
+   —— **必须由 launchd 拉起**，否则 TCC 记的是终端的身份，面板仍然没授权；
+4. 人勾一次「隐私与安全性 > 屏幕录制 > 灵台智枢」；
+5. 撤变量、重启面板，然后**真录 2 秒**验证落盘文件 >10KB 才报成功。
+
+**平时绝不弹**：`flash.swift` 里那段 `CGRequestScreenCaptureAccess()` 被
+`LINGTAI_REC_PROMPT=1` 保护，变量不存在时**一行都不执行**（ERR-0023：自动弹窗被投诉过）。
+
+查状态（两个身份要分开看）：
+
+```bash
+macctl screencap                        # 本进程身份：screencap=1 / 0
+tr ' ' '\n' < /tmp/flash.hotkey | grep '^rec='   # 面板身份（录屏实际用的就是这个）
+flash ~/.../flash --status              # 面板状态里也印一行「屏幕录制」
+```
+
+> ⚠ 终端里 `macctl screencap` 读到 1 **不代表**面板是 1 —— TCC 按「可执行文件 +
+> 签名 + 负责进程」认人。真正要看的那个数是面板自己写进 `/tmp/flash.hotkey` 的 `rec=`。
+

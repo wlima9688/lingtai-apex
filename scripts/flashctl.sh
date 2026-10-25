@@ -15,6 +15,8 @@
 #   flashctl.sh stop       停止
 #   flashctl.sh status     看状态
 #   flashctl.sh key f5 "ctrl+alt"  改热键并重装自启（默认 ⌃⌥S）
+#   flashctl.sh ax       一键修「辅助功能」授权（只在你主动跑时弹一次）
+#   flashctl.sh rec      一键修「屏幕录制」授权（录视频用；截图不需要）
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LABEL="com.lingtai.apex"
@@ -30,7 +32,9 @@ fi
 LOG="/tmp/flash.log"
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \?//'
+  # 印完文件头那段注释就停 —— 不写死行号：写死的话这里加一行用法，
+  # 就得同步改范围，否则会把 DIR=/LABEL= 这些代码行也印出来（踩过）。
+  awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"
 }
 
 # ⚠ 判「在不在跑」不能只靠 pgrep：沙箱里 `pgrep` 可能被拦（operation not
@@ -375,6 +379,116 @@ case "$cmd" in
       echo "      再跑一次 $0 ax 即可（可重复执行，安全）。"
     fi
     echo "   热键状态：$(tr ' ' '\n' < /tmp/flash.hotkey 2>/dev/null | grep -E '^(carbon|tap|ax)=' | tr '\n' ' ')"
+    ;;
+
+  # ── 屏幕录制授权：一键修，且**平时绝不弹窗**（P13）────────────────
+  #
+  # ⚠ 为什么必须单独做一次「屏幕录制」：截图已经彻底不需要授权（走 launchd 的
+  #   mediacap，见 ERR-0022）；但视频 `screencapture -v` 从 launchd 拉起时会被**拒**
+  #   （实测 capture error「这项操作无法完成」）。所以视频必须有这一次勾选。
+  #   做法与上面的 ax) 逐字同构（那套已经验证有效）：
+  #     ① tccutil 清掉僵尸记录（改过 bundle id / 重签后会残留"显示已勾选、
+  #        实际绑旧哈希"的死条目，手动勾多少遍都没用）
+  #     ② 给 LaunchAgent **临时**注入 LINGTAI_REC_PROMPT=1，bootout/bootstrap/kickstart
+  #        —— **必须由 launchd 拉起**，TCC 记的才是「灵台智枢.app」；从终端直接跑
+  #        会继承终端的授权身份，等于给终端申请，面板还是没授权
+  #     ③ 人去「隐私与安全性 > 屏幕录制」勾一次（就这一次）
+  #     ④ 撤变量 + 重启面板（平时那个变量不存在 → flash.swift 一行都不执行）
+  #     ⑤ 真录 2 秒验证：落盘文件存在且 >10KB
+  # ⚠⚠ 守卫：已经授权就**什么都别做** —— 本分支第一步是 tccutil reset，
+  #   那会**主动清掉**现有授权。用户手一抖跑一次，刚拿到的好授权就没了。
+  #   rec= 这一位是**面板自己的身份**（flash.swift 里用 CGPreflightScreenCaptureAccess
+  #   写进 /tmp/flash.hotkey），比在终端里问一次准 —— 终端有授权不代表面板有。
+  rec)
+    UID_N="$(id -u)"
+    REC_STATE="$(tr ' ' '\n' < /tmp/flash.hotkey 2>/dev/null | grep '^rec=' | head -1)"
+    if [ "$REC_STATE" = "rec=1" ]; then
+      echo "✅ 屏幕录制已经是好的（面板身份 rec=1），不需要修。"
+      echo "   本命令会先 tccutil reset 清授权，所以**不做任何操作**。"
+      echo "   若录屏仍然失败，先看：$DIR/screen_rec.sh --status"
+      echo "   录屏产物在：~/桌面/灵台智枢/录屏/年/月/"
+      exit 0
+    fi
+    if [ ! -f "$PLIST" ]; then
+      echo "❌ 还没注册开机自启（缺 ${PLIST}）"
+      echo "   先跑：$0 install   然后再跑 $0 rec"
+      exit 1
+    fi
+
+    echo "═══ 灵台智枢 · 屏幕录制授权 ═══"
+    echo "  只会弹这一次，之后不再弹（平时一行相关代码都不执行）。"
+    echo "  截图不受影响：截图早就免授权了，这里只管**录视频**。"
+    echo ""
+
+    # ① 清旧记录
+    echo "① 清理旧的授权记录"
+    tccutil reset "ScreenCapture" "$LABEL" 2>&1 | head -1
+    echo "   ✅ 已清空（系统设置里那条「灵台智枢」会消失，这是正常的）"
+    echo ""
+
+    # ② 临时注入环境变量，让 launchd 拉起的那个面板去申请一次
+    echo "② 让 launchd 拉起的面板申请授权"
+    /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:LINGTAI_REC_PROMPT" "$PLIST" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$PLIST" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:LINGTAI_REC_PROMPT string 1" "$PLIST" 2>/dev/null
+    if ! /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:LINGTAI_REC_PROMPT" "$PLIST" 2>/dev/null | grep -q 1; then
+      echo "   ❌ 写 plist 失败（$PLIST 不可写？）"
+      exit 1
+    fi
+    # ⚠ 顺序不能换：先 bootout 再 pkill，否则 KeepAlive 会立刻拉起一份
+    #   没带环境变量的旧实例，把申请时机吃掉。
+    launchctl bootout "gui/$UID_N/$LABEL" 2>/dev/null
+    pkill -f "MacOS/flash" 2>/dev/null
+    sleep 1
+    launchctl bootstrap "gui/$UID_N" "$PLIST" 2>/dev/null
+    launchctl kickstart -k "gui/$UID_N/$LABEL" 2>/dev/null
+    sleep 4
+    echo "   ✅ 面板已由 launchd 重启，授权框应该已经弹出来了"
+    echo ""
+
+    # ③ 让用户去勾（这一次）
+    echo "③ 请你操作（就这一次）"
+    echo "   屏幕上的框：「灵台智枢」想要录制此电脑的屏幕和音频"
+    echo "     → 点「打开系统设置」"
+    echo "     → 在「隐私与安全性 > 屏幕录制」里找到「灵台智枢」，把开关打开"
+    echo "     → 列表里没有就点左下角 + 号，选 $APP_BUNDLE"
+    echo "     → 若系统提示「需要退出并重新打开」，就照它说的做（面板会自动重启）"
+    printf '\n   勾好了就按回车，我来收尾并验证：'
+    read -r _ </dev/tty 2>/dev/null || { echo ""; echo "   （没有交互终端，3 秒后自动继续）"; sleep 3; }
+    echo ""
+
+    # ④ 撤掉临时变量并重启面板（这一步之后，平时那个分支就永不执行了）
+    echo "④ 撤掉临时变量并重启面板"
+    /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:LINGTAI_REC_PROMPT" "$PLIST" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables" "$PLIST" 2>/dev/null
+    launchctl bootout "gui/$UID_N/$LABEL" 2>/dev/null
+    pkill -f "MacOS/flash" 2>/dev/null
+    sleep 1
+    launchctl bootstrap "gui/$UID_N" "$PLIST" 2>/dev/null
+    launchctl kickstart -k "gui/$UID_N/$LABEL" 2>/dev/null
+    sleep 4
+    echo "   ✅ 面板已重启（环境变量已撤，平时不会再有申请动作）"
+    echo ""
+
+    # ⑤ 验证：真录 2 秒（判据必须盯"用户看得见的东西"：文件存在且 >10KB）
+    echo "⑤ 验证：真录 2 秒"
+    REC_REPORT="$DIR/.screenrec.out"
+    rm -f "$REC_REPORT"
+    "$DIR/screen_rec.sh" --start --seconds 2 >/tmp/flash-rec-verify.json 2>&1
+    sleep 5
+    REC_FILE="$(cat "$REC_REPORT" 2>/dev/null)"
+    REC_SIZE="$(stat -f%z "$REC_FILE" 2>/dev/null || echo 0)"
+    if [ -n "$REC_FILE" ] && [ -f "$REC_FILE" ] && [ "${REC_SIZE:-0}" -gt 10240 ]; then
+      echo "   ✅ 录屏已可用：${REC_FILE}（${REC_SIZE} 字节 / 2 秒样片，可直接删）"
+      echo "      录屏产物统一落：~/桌面/灵台智枢/录屏/年/月/"
+    else
+      echo "   ❌ 还是不行：文件 ${REC_FILE:-（没生成）}，大小 ${REC_SIZE:-0} 字节（应 >10KB）"
+      echo "      常见原因：① 勾完没等面板重启；② 勾的是旧条目（列表里有两个就删掉旧的）；"
+      echo "               ③ 系统可能要求「退出并重新打开」面板 —— 跑 $0 restart 再验一次。"
+      echo "      再跑一次 $0 rec 即可（可重复执行，已有授权时它会直接退出）。"
+      echo "      明细：/tmp/flash-rec-verify.json"
+    fi
+    echo "   面板状态：$(tr ' ' '\n' < /tmp/flash.hotkey 2>/dev/null | grep -E '^(carbon|tap|ax|rec)=' | tr '\n' ' ')"
     ;;
 
   open)

@@ -2267,12 +2267,34 @@ fi
 # 20.10b 缺「屏幕录制」授权时，面板不得先藏再拍（白闪一下更像坏了）
 #   用户视角：点了截图 → 面板闪一下又回来 → 状态栏报错 = "好像没反应"。
 #   正确做法：先 CGPreflightScreenCaptureAccess()，缺就直接说清该勾哪一项。
+# ⚠ P13 起判据要更细：**录屏**那一支现在确实会请求一次授权
+#   （截图早就不用问了，但 `screencapture -v` 必须有这一次勾选）——
+#   所以不能再用"文件里出现 CGRequestScreenCaptureAccess() 就算违规"这种粗判，
+#   否则合法的新代码会被判红（本次实测就红了一条）。
+#   真正要守的是：**每一次**请求都必须在 LINGTAI_REC_PROMPT 守卫后面
+#   （变量不存在 → 一行都不执行 → 平时绝不弹窗，ERR-0023）。
+ATH_UNGUARDED="$(/usr/bin/python3 - "$FLASH_SW" <<'PY'
+import io, sys
+lines = io.open(sys.argv[1], encoding="utf-8").read().splitlines()
+bad = []
+for i, ln in enumerate(lines):
+    s = ln.strip()
+    if s.startswith("//"):                  # 注释里提到不算调用
+        continue
+    if "CGRequestScreenCaptureAccess(" not in ln:
+        continue
+    ctx = "\n".join(lines[max(0, i - 6):i + 1])   # 往上看 6 行找守卫
+    if "LINGTAI_REC_PROMPT" not in ctx:
+        bad.append(str(i + 1))
+print(" ".join(bad))
+PY
+)"
 if grep -q 'com.lingtai.mediacap' "$FLASH_SW" \
    && grep -q 'mediacap.request' "$FLASH_SW" \
-   && ! grep -q 'CGRequestScreenCaptureAccess()' "$FLASH_SW"; then
-  t_ok "面板截图走 launchd 的 mediacap job（不依赖 App 授权，也不弹授权框）"
+   && [ -z "$ATH_UNGUARDED" ]; then
+  t_ok "面板截图走 launchd 的 mediacap job（不依赖 App 授权，也不弹授权框；唯一的授权申请被 LINGTAI_REC_PROMPT 守卫，只有 flashctl.sh rec 时才执行）"
 else
-  t_fail "面板截图仍走 App 自身权限 —— 会弹系统授权框且授权失效时拍不了"
+  t_fail "面板截图仍走 App 自身权限，或存在**无守卫**的 CGRequestScreenCaptureAccess 调用（行 ${ATH_UNGUARDED:-无}）—— 会弹系统授权框且授权失效时拍不了"
 fi
 
 # 20.10d 截图要两种模式：藏面板 / 含面板
@@ -2622,8 +2644,9 @@ PYEOF
 }
 
 # ── 第 1 轮：⓪键盘 / ①旋转 / ②尺寸 三条断言共用这一轮的测量 ──
-#    只有 ② 会在量歪时重放一轮（见下方重试块）；⓪① 永远用第一轮，
-#    它们各自的判据与阈值一个字没动。
+#    ① 和 ② 都会在量不达标时**重放一轮再量**（各自最多 3 次，见下方两个
+#    重试块，P11/P13）；⓪ 永远用第一轮 —— 它读的是当轮的 debug 日志，
+#    重放轮覆盖了也一样（判据是"窗口拿到键盘"，不是像素量）。
 STAR_MEASURE="$(star_round)"
 STAR_DIFF="${STAR_MEASURE%% *}"
 STAR_BAND="$(echo "$STAR_MEASURE" | cut -d' ' -f2)"
@@ -2644,10 +2667,43 @@ elif [ -z "$STAR_WIN" ]; then
 else
   t_fail "开场窗口键盘链路断了：key=$STAR_KEY firstResp=$STAR_RESP active=${STAR_ACT}（三项须全 true）—— 用户按 Space/Enter 会没反应"
 fi
-if [ "${STAR_DIFF:-0}" -gt 1000 ] && [ "${STAR_BAND:-0}" -gt 800 ]; then
-  t_ok "五角星周围确实在转：帧间变化 ${STAR_DIFF}px，其中 ${STAR_BAND}px 落在环带（120~215px）"
+# ── ① 旋转：帧差/环带，最多 3 次，任一次达标即算通过（P13）────────────
+#   现状（P13 之前）：这条**没有重试**，十跑三四红，同一份代码复跑就绿。
+#   根因与 ② 尺寸那条同源 —— 不是功能坏了，是**测量时序**：
+#   机器负载高（正在编译/刚开机）时 screencapture 拍到的是洗白过场，
+#   两帧几乎一样（甚至整屏一样），帧差与环带一起塌下来。
+#   对策照 star_round()（P11 已验证有效）的做法：量不达标就按同一节奏
+#   （杀 wblaunch → 0.8s → play → 3.0s 抓 A 帧 → +1.8s 抓 B 帧）
+#   再放一轮、再量一次，最多 3 次，任一次达标即通过。
+#   ⚠ 阈值 >1000 / >800 一个字没改：放宽的是**测量的机会**，不是标准。
+#   ⚠ 失败信息必须带三次的数值 —— 一眼分得清「真坏了」和「环境慢」。
+#   ⚠ 重试轮顺带刷新 STAR_W/H/EXT：那是同一轮测出来的数，给 ② 用最省时间
+#     （② 若仍不合格，下面还有它自己的重试循环）。
+star_band_ok() {  # star_band_ok <帧差> <环带>
+  [ "${1:-0}" -gt 1000 ] && [ "${2:-0}" -gt 800 ]
+}
+STAR_BAND_LOG="${STAR_DIFF:-?}/${STAR_BAND:-?}"   # 每次量到的「帧差/环带」，按次数用 / 分隔
+STAR_BAND_TRIES=1
+STAR_BAND_PASS=0     # ① 的结论位：后面「删不删现场截图」要用它，不能靠最后一次的数
+while ! star_band_ok "${STAR_DIFF:-0}" "${STAR_BAND:-0}" && [ "$STAR_BAND_TRIES" -lt 3 ]; do
+  STAR_BAND_TRIES=$((STAR_BAND_TRIES + 1))
+  STAR_MEASURE="$(star_round)"
+  STAR_DIFF="${STAR_MEASURE%% *}"
+  STAR_BAND="$(echo "$STAR_MEASURE" | cut -d' ' -f2)"
+  STAR_W="$(echo "$STAR_MEASURE" | cut -d' ' -f3)"
+  STAR_H="$(echo "$STAR_MEASURE" | cut -d' ' -f4)"
+  STAR_EXT="$(echo "$STAR_MEASURE" | cut -d' ' -f5-8)"
+  STAR_BAND_LOG="${STAR_BAND_LOG} / ${STAR_DIFF:-?}/${STAR_BAND:-?}"
+done
+if star_band_ok "${STAR_DIFF:-0}" "${STAR_BAND:-0}"; then
+  STAR_BAND_PASS=1
+  if [ "$STAR_BAND_TRIES" -gt 1 ]; then
+    t_ok "五角星周围确实在转：帧间变化 ${STAR_DIFF}px，其中 ${STAR_BAND}px 落在环带（120~215px）（第 ${STAR_BAND_TRIES} 次量到；各次 帧差/环带 = ${STAR_BAND_LOG} —— 首量空转是截图时序漂移，非功能问题）"
+  else
+    t_ok "五角星周围确实在转：帧间变化 ${STAR_DIFF}px，其中 ${STAR_BAND}px 落在环带（120~215px）"
+  fi
 else
-  t_fail "旋转环没动或动静不对：帧差=${STAR_DIFF} 环带=${STAR_BAND}（应 >1000/>800）—— 现场 ${STAR_SHOT_A} / ${STAR_SHOT_B}；transform-box 没生效？或窗口没起来（见 ${STAR_DEBUG}）"
+  t_fail "旋转环没动或动静不对：${STAR_BAND_TRIES} 次「帧差/环带」依次为 ${STAR_BAND_LOG}（应 >1000/>800，阈值未放宽）—— 三次全不达标多半是真坏了：transform-box/动画没生效；若只有某次离谱地小（如 帧差<100）则更像截图没进第一幕（现场 ${STAR_SHOT_A} / ${STAR_SHOT_B}；debug ${STAR_DEBUG}）"
 fi
 # ── ② 尺寸：最多量 3 次，任一次落在 275~350 就算通过（P11）────────────
 #   现象：十跑五六红，报错量到 2384×290（宽被撑到半屏），同一份代码复跑就绿。
@@ -2686,8 +2742,9 @@ else
 fi
 
 # 两项视觉断言都过 → 删现场；任一失败 → 留着给人看（不再"删完才报错"）
-if [ "${STAR_DIFF:-0}" -gt 1000 ] && [ "${STAR_BAND:-0}" -gt 800 ] \
-   && star_box_ok "${STAR_W:-0}" "${STAR_H:-0}"; then
+# ⚠ 判据用 PASS 结论位、不用最后一次的数值：① 允许重试后，"最后一次"可能是
+#   ② 的重试轮（只量尺寸），数值跟 ① 的结论已经不是一回事了。
+if [ "${STAR_BAND_PASS:-0}" = "1" ] && star_box_ok "${STAR_W:-0}" "${STAR_H:-0}"; then
   rm -f "$STAR_SHOT_A" "$STAR_SHOT_B" "$STAR_DEBUG"
 fi
 

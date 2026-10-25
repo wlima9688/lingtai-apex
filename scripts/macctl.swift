@@ -129,6 +129,51 @@ func frontApp() -> NSRunningApplication? {
     NSWorkspace.shared.frontmostApplication
 }
 
+/// 发合成事件前的安全闸：目标 App 不在前台就拒发。
+///
+/// 为什么（2026-10-25 真事故，ERR-0024）：没确认前台就发合成键盘事件，
+/// 任务文本被打进了**用户微信的输入框** —— 只差一个回车就是"替他发了条消息"。
+/// 判据只认一条：系统认定的 frontmostApplication 必须就是目标 App。
+/// ⚠ 不要用"窗口可见 / 有 AX 焦点 / 元素找得到"来近似：窗口被压在后面、
+///   而键盘焦点还留在它身上是完全可能的，而合成事件跟的是**焦点**不是可见性。
+func requireFront(_ bid: String) -> Bool {
+    let actual = frontApp()?.bundleIdentifier ?? "(无前台应用)"
+    if actual == bid { return true }
+    out("❌ 拒绝发送：目标不是前台（当前前台 \(actual) / 目标 \(bid)）")
+    return false
+}
+
+/// 三个"发事件"命令（type / key / tap-text）共用的入口闸：
+/// 解析参数 → 得出要校验的目标 → 校验。返回 false 的调用方必须 `exit(4)`，
+/// **一个键都不许发**。
+///
+/// 合法写法（`--force-front` > `--require-front` > `--app`）：
+///   · `--force-front`          显式声明跳过（只给"我确知在发盲事件"的调用方）
+///   · `--require-front <bid>`  显式声明校验对象
+///   · `--app <bundleid|名称>`  命令本来就带的操盘对象
+/// 一个都不给 → **拒绝**。默认必须安全：默认放行正是当年那次事故的根因，
+/// 所以这里绝不写"没给就跳过校验"的分支。
+func frontGate(_ a: Args, appArg: String, cmd: String) -> Bool {
+    if a.has("force-front") {
+        out("⚠ \(cmd)：已按 --force-front 跳过前台校验")
+        return true
+    }
+    var targets: [String] = []
+    let rf = a.str("require-front")
+    if !rf.isEmpty { targets.append(resolveBundle(rf) ?? rf) }
+    if !appArg.isEmpty {
+        let r = resolveBundle(appArg) ?? appArg
+        if !targets.contains(r) { targets.append(r) }
+    }
+    guard !targets.isEmpty else {
+        out("❌ 拒绝发送：\(cmd) 没有指定目标 App —— 拒绝无校验发送")
+        out("   请显式传 --app <bundleid> / --require-front <bundleid> / --force-front")
+        return false
+    }
+    for t in targets where !requireFront(t) { return false }
+    return true
+}
+
 /// 应用名（磁盘目录名 / CFBundleName）→ bundle id。
 ///
 /// ⚠ 只走 Spotlight 的**精确**匹配（kMDItemFSName == 'X.app'），
@@ -1220,6 +1265,13 @@ func cmdType() {
     //   blind 模式只做「剪贴板 + ⌘V」，不校验内容（读不到就没法校验，如实说明）。
     let blind = a.has("blind")
     let bid = blind ? "" : (a.str("app").isEmpty ? (frontApp()?.bundleIdentifier ?? "") : a.str("app"))
+
+    // ── 安全闸（ERR-0024）：目标不是前台就一个键都不发 ──────────────
+    // ⚠ `--blind` 不知道目标是谁（面板自己是裸二进制、没有 bundle id），
+    //   所以它**必须**靠 --require-front / --force-front 显式说明，
+    //   否则一样拒发 —— 当年打进微信的那一次，走的正是"不知道目标也照发"。
+    if !frontGate(a, appArg: a.str("app"), cmd: "type") { exit(4) }
+
     let b: String
     if blind {
         b = ""
@@ -1327,6 +1379,10 @@ func cmdKey() {
     let a = Args(ARGV)
     let name = a.str("key").isEmpty ? a.positional.first ?? "" : a.str("key")
     guard !name.isEmpty else { die("需要 --key") }
+    // ── 安全闸（ERR-0024）：按键必须落到"前台那个 App"身上 ────────────
+    // ⚠ 键盘事件没有"收件人"参数，发出去就是当前焦点收着 —— 前台不对，
+    //   回车/⌘V 就落到别人的输入框里。所以 --app/--require-front 必须给。
+    if !frontGate(a, appArg: a.str("app"), cmd: "key") { exit(4) }
     let n = a.int("count", 1)
     for _ in 0..<n {
         keyPress(name, cmd: a.has("cmd"), shift: a.has("shift"), alt: a.has("alt"), ctrl: a.has("ctrl"))
@@ -1537,6 +1593,24 @@ func cmdAppVolume() {
         curPct = now
     }
     if let (now, _) = readPct() { out("最终应用音量 = \(now)%") }
+}
+
+/// 屏幕录制授权状态（P3）。
+///
+/// 为什么需要单独一条：截图已经彻底不需要授权（走 launchd 的 mediacap，ERR-0022），
+/// 但 `screencapture -v` **必须**有一次「屏幕录制」勾选。判断"要不要修"就必须先能
+/// 读到**这个进程身份**下的授权真相 —— `flashctl.sh rec` 拿它做守卫，
+/// 已经是 1 就一个字都不动（否则第一步的 tccutil reset 会把好授权清掉）。
+func cmdScreencap() {
+    let a = Args(ARGV)
+    let ok = CGPreflightScreenCaptureAccess()
+    if a.has("json") {
+        out("{\"ok\":true,\"screencap\":\(ok ? 1 : 0)}")
+    } else {
+        out("screencap=\(ok ? 1 : 0)（1=已授权 / 0=未授权；按本进程身份判定）")
+        out("  想看「灵台智枢.app」自身的状态，请读 /tmp/flash.hotkey 里的 rec= 位（面板自己写的）")
+    }
+    exit(ok ? 0 : 1)
 }
 
 func cmdShot() {
@@ -3441,6 +3515,11 @@ func cmdTapText() {
     let rect = parseRect(a.str("rect"))
     let appOpt = a.str("app")
 
+    // ── 安全闸（ERR-0024）：点下去之前先确认前台是目标 App ─────────────
+    // ⚠ 这一支更险：坐标是**按整屏/整窗 OCR 算出来的**，一旦窗口被别的 App
+    //   挡住或已切走，同一个坐标点下去就是点别人。
+    if !frontGate(a, appArg: appOpt, cmd: "tap-text") { exit(4) }
+
     // 取图：--app 用排他窗口图，否则全屏
     var img: CGImage? = nil
     var origin = CGPoint.zero
@@ -3612,13 +3691,16 @@ macctl \(VERSION) — macOS 桌面自动化统一工具
   tree      --app <id> [--role R] [--text T] [--depth N]
   find      --text <T> [--app all|id] [--role R] [--limit N]
   click     --text <T> [--app <id>] [--count N] [--scroll N] | --at x,y
-  type      --text <T> [--app <id>]    智能输入（AX/粘贴/Unicode 自动择优并记忆）
-  key       --key <name> [--cmd] [--shift] [--count N]
+  type      --text <T> --app <id>     智能输入（AX/粘贴/Unicode 自动择优并记忆）
+  key       --key <name> --app <id> [--cmd] [--shift] [--count N]
+  ⚠ type/key/tap-text 发合成事件前会校验前台：--app 或 --require-front <bid> 必须给，
+    两者都不给直接 exit 4（拒绝发送）。确知自己在发盲事件才用 --force-front。
   mods      --ctrl --alt --cmd          合成「纯修饰键组合」（测三键同按类热键）
   clear     [--app <id>]                清空聚焦输入框（AX 优先，回退 cmd+a+delete）
   volume    [--set N]                  系统输出音量
   app-volume --app <id> --to N         应用内音量（AXSlider 或气泡像素闭环）
   shot      [--out <路径>] [--rect x,y,w,h] [--app <id>]
+  screencap [--json]                   屏幕录制授权状态（1/0，按本进程身份）
   pixel     --at x,y                   读取屏幕某点颜色
   wait      --text <T> [--timeout S] [--app <id>]
   scroll    [--dir up|down|left|right] [--n N] [--at x,y] [--app <id>]
@@ -3682,6 +3764,7 @@ case "clear": cmdClear()
 case "volume": cmdVolume()
 case "app-volume": cmdAppVolume()
 case "shot": cmdShot()
+case "screencap": cmdScreencap()
 case "pixel": cmdPixel()
 case "wait": cmdWait()
 case "scroll": cmdScroll()

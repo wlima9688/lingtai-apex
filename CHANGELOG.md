@@ -1,6 +1,29 @@
 # 版本历史
 
 
+## v1.9.5 — 2026-10-25（P13 三项收尾）
+
+**① 合成事件前台守卫 / ② 环带断言重试 / ③ 录屏授权一键化**
+
+1. **事件注入前台守卫**（ERR-0024 事故）：`macctl` 新增 `requireFront()` +
+   `frontGate()`，`type` / `key` / `tap-text` 在**发第一个事件之前**校验
+   `frontApp()?.bundleIdentifier`，不匹配打印「❌ 拒绝发送：目标不是前台（当前前台 X / 目标 Y）」
+   并 `exit 4`。参数三档：`--force-front` > `--require-front <bid>` > `--app`，
+   **一个都不给就拒绝**（默认安全，不再"没给 --app 就拿当前前台当目标"）。
+   调用点补齐：`flash.swift`（面板粘贴/回车）、`flash_handoff.swift`、
+   `wechat_send.sh`（⌘F/⌘V/回车）、`music_play.sh`（Esc/⌘V/回车）。
+2. **自检环带断言加重试**：`selftest.sh` 新增 `star_band_ok()`，照 `star_round()`
+   的节奏最多量 3 次、任一次达标即通过；阈值 `>1000/>800` 未动；
+   失败信息带三次数值；新增 `STAR_BAND_PASS` 结论位（删不删现场看结论不看最后一次数值）。
+3. **录屏授权一键化**：`flash.swift` 加受 `LINGTAI_REC_PROMPT=1` 保护的
+   `CGRequestScreenCaptureAccess()`（平时一行不执行），并把 `rec=` 写进 `/tmp/flash.hotkey`，
+   `--status` 多报一行录制授权；`flashctl.sh rec` 照 `ax)` 结构做成五步一键
+   （守卫 `rec=1` 直接退出 → reset → 注入变量 → 人勾一次 → 撤变量重启 → 真录 2 秒验 >10KB）；
+   `macctl screencap` 查 preflight；桌面加 `修复屏幕录制授权.command`。
+
+**自检**：`selftest.sh --keep-muted` 连跑两次 → 两次「失败 0 项」；`lint.sh` 通过；
+`flash --layout-check` → 800x606 · 14 个按钮
+
 ## v1.9.4 — 2026-10-25（P10 目录重构）
 
 **截图/录屏分家 + 年/月 归档：根下不再有媒体文件**
