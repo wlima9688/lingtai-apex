@@ -1,6 +1,29 @@
 # 版本历史
 
 
+## v1.9.6 — 2026-10-25（P14 自检队列隔离）
+
+**自检不再污染生产确认队列（B-019）**
+
+1. **队列目录可覆盖**：`flashkit.swift` 的 `queueDir()` 认 `LINGTAI_QUEUE_DIR`，
+   非空即覆盖，没设才用 `~/.workbuddy/skills/mac-control/queue`。
+   背景：自检造出的假待确认项（`给张三 发微信 / 你好`）留在生产队列里，
+   桌面菜单栏从 `⚡️` 变成 `⚠️1`，用户以为程序坏了；而那条假项**是能点的**，
+   点了会真发消息。
+2. **自检全程临时队列 + 结束清理**：`selftest.sh` 在 `source common.sh` 之前
+   `export LINGTAI_QUEUE_DIR="$(mktemp -d /tmp/lt-selftest-queue.XXXXXX)/queue"`，
+   并把清理串进已有 `trap`（`_finish; _cleanup_selftest_queue`）——
+   不另起一条 EXIT trap，否则会顶掉恢复静音的 `_finish`。
+3. **新增第 24 节「队列隔离回归」**：24.1 队列确实指到 `/tmp/lt-selftest-queue.*`；
+   24.2 生产 pending 文件数与开跑前快照一致；24.3 生产 pending 无「张三/你好/测试」条目。
+   13.9 改为显式盯生产路径。
+4. **顺手修 lint 失败信息**：自检里原来只报 `tail -3`，真正的失败项被截掉，
+   改成抓 `❌` 行（这次就是靠它才定位到问题）。
+
+**自检**：`selftest.sh --keep-muted` → 通过 196 项、失败 0 项；跑完 pending=0、
+`/tmp/lt-selftest-queue.*` 已清空；`lint.sh` 通过；`flash --layout-check` 未动。
+历史清理：`queue/answered/` 211 个文件全部是测试产物（清单见工作目录），待用户决定是否清空。
+
 ## v1.9.5 — 2026-10-25（P13 三项收尾）
 
 **① 合成事件前台守卫 / ② 环带断言重试 / ③ 录屏授权一键化**

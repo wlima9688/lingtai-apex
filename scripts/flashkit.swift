@@ -23,6 +23,11 @@ import Foundation
 
 /// 待确认项的存放目录（由 common.sh 的 QUEUE_DIR 保持一致）
 func queueDir() -> String {
+    // 2026-10-25：自检必须能把队列指到临时目录，否则它造的假待确认项
+    // 会亮起菜单栏 ⚠️N，用户以为程序坏了（真实发生过）。
+    if let override = ProcessInfo.processInfo.environment["LINGTAI_QUEUE_DIR"], !override.isEmpty {
+        return override
+    }
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     return "\(home)/.workbuddy/skills/mac-control/queue"
 }

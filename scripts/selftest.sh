@@ -26,6 +26,22 @@ SKILL_DIR="$(cd "$DIR/.." && pwd)"
 # 自检日志隔离：测试故意触发的失败不能污染用户审计日志/复盘统计
 export SHANKONG_LOG_DIR="$(mktemp -d -t shankong_selftest_logs)"
 SELFTEST_LOG_DIR="$SHANKONG_LOG_DIR"
+
+# ══ 队列隔离（P14 · 2026-10-25）═══════════════════════════════════
+# 症状：自检造出的假待确认项（「给张三 发微信 / 你好 / 对外发送（不可撤销）」）
+#   留在**生产队列**里，桌面菜单栏图标从 ⚡️ 变成 ⚠️1，用户以为程序坏了。
+#   更糟的是用户可能真去点「确认」—— 一点就真把消息发出去。
+# 根因：queueDir() 硬编码生产路径，自检 fork 出来的 flash 子进程只能写那儿。
+# 修法：自检全程把队列指到临时目录（flashkit.swift 的 queueDir() 认这个变量，
+#   `flash queue *` 由本脚本 fork，环境变量自然继承），退出时无条件删掉。
+#   ⚠ 必须在 source common.sh 之前 export：后面大量断言 fork 子进程，晚设就漏。
+export LINGTAI_QUEUE_DIR="$(mktemp -d /tmp/lt-selftest-queue.XXXXXX)/queue"
+mkdir -p "$LINGTAI_QUEUE_DIR/pending" "$LINGTAI_QUEUE_DIR/answered"
+
+# 生产队列基线（第 24 节回归断言用）：跑之前拍快照，跑完必须一模一样
+PROD_PENDING="$SKILL_DIR/queue/pending"
+PROD_PENDING_BASE="$(ls -1A "$PROD_PENDING" 2>/dev/null | wc -l | tr -d ' ')"
+
 source "$DIR/common.sh"
 
 # ⚠ 必须切到 scripts/：大量断言用 ./route.sh、grep flash.swift 这类**相对路径**
@@ -73,7 +89,15 @@ _finish() {
   fi
   [ -n "${SELFTEST_LOG_DIR:-}" ] && rm -rf "$SELFTEST_LOG_DIR"
 }
-trap '_finish' EXIT
+
+# 临时队列无条件清掉：成功/失败/被 Ctrl-C 都得走，别在 /tmp 堆垃圾。
+# ⚠ 不能另起一条 `trap ... EXIT` —— 那会把上面恢复静音的 _finish 顶掉
+#   （静音守卫就永远不还原，用户电脑一直是哑的）。必须串在同一条 trap 里。
+_cleanup_selftest_queue() {
+  [ -n "${LINGTAI_QUEUE_DIR:-}" ] && rm -rf "$(dirname "$LINGTAI_QUEUE_DIR")"
+  return 0
+}
+trap '_finish; _cleanup_selftest_queue' EXIT
 
 say ""
 say "=== 闪控自检 ==="
@@ -205,7 +229,10 @@ say "--- 9. lint 一致性 ---"
 if bash "$DIR/lint.sh" >/dev/null 2>&1; then
   t_ok "lint 通过"
 else
-  t_fail "lint 失败：$(bash "$DIR/lint.sh" 2>&1 | tail -3 | tr '\n' ' ')"
+  # ⚠ 别用 `tail -3`：lint 末尾固定是「✓ 无管道…」+「❌ lint 失败：N 个问题」，
+  #   真正的失败项在中间，被 tail 掉了 —— 实测只看到「1 个问题」却不知道是哪条，
+  #   白查一轮。直接抓带 ❌ 的那几行。
+  t_fail "lint 失败：$(bash "$DIR/lint.sh" 2>&1 | grep '❌' | tr '\n' ' ')"
 fi
 
 # ── 10. 回归：历史踩坑防线 ──────────────────────────────────────
@@ -711,7 +738,11 @@ fi
 AT="$("$DIR/flash" queue add --id "st_args_$$" --title T --detail D \
       --script /bin/echo --args "--to,张三,--msg,你好" --risk R 2>/dev/null)"
 AT_LIST="$("$DIR/flash" queue list 2>/dev/null)"
-rm -f "$SKILL_DIR/queue/pending/st_args_$$.json" 2>/dev/null
+# ⚠ 清理的是**临时队列**里的自检条目，不是生产队列（P14）：改前这里写死
+#   $SKILL_DIR/queue/pending，一旦 LINGTAI_QUEUE_DIR 生效，这条 rm 会扑空，
+#   自检条目就留在临时队列里直到退出 trap 清掉 —— 不致命，但会让
+#   「生产队列是否被污染」的判断失去参照，所以必须跟着变量走。
+rm -f "$LINGTAI_QUEUE_DIR/pending/st_args_$$.json" 2>/dev/null
 if grep -q '"--msg"' <<< "$AT_LIST"  && grep -q '张三' <<< "$AT_LIST" ; then
   t_ok "队列参数解析：以 -- 开头的列表值不会丢"
 else
@@ -750,10 +781,12 @@ else
 fi
 
 # 13.9 队列目录不能有残留测试数据
-if [ -z "$(ls -A "$SKILL_DIR/queue/pending" 2>/dev/null)" ]; then
+# ⚠ 这里故意写死**生产**路径（不走 $LINGTAI_QUEUE_DIR）：要检查的正是
+#   「生产队列有没有被自检弄脏」，指到临时目录就等于什么都没验（P14）。
+if [ -z "$(ls -A "$PROD_PENDING" 2>/dev/null)" ]; then
   t_ok "确认队列干净（无残留待确认项）"
 else
-  t_fail "确认队列有残留文件：$(ls "$SKILL_DIR/queue/pending" 2>/dev/null | tr '\n' ' ')"
+  t_fail "确认队列有残留文件：$(ls "$PROD_PENDING" 2>/dev/null | tr '\n' ' ')"
 fi
 
 # 13.10 口语化兜底层必须真的接住日常说法
@@ -2909,6 +2942,43 @@ if /usr/bin/plutil -p "$PLIST" 2>/dev/null | grep -A3 '"KeepAlive"' | grep -qE '
   t_ok "LaunchAgent 配了 KeepAlive（异常退出会被 launchd 拉起）"
 else
   t_fail "plist 没配 KeepAlive —— 闪控被杀掉后热键会一直失效"
+fi
+
+# ══ 24. 队列隔离回归（P14 · 2026-10-25）═════════════════════════
+# 用户原话：「菜单栏图标从 ⚡️ 变成 ⚠️1，我以为程序坏了」。
+# 假待确认项一旦落进生产队列，用户点「确认」就真把消息发出去 ——
+# 这不是显示问题，是**能造成真实外部副作用**的问题。
+# 所以隔离本身也要有断言：光改了代码、下次谁又写死一次生产路径，
+# 也必须被这一节抓住。
+say "--- 24. 队列隔离回归 ---"
+
+# 24.1 自检期间队列必须指向临时目录
+# ⚠ 先把值落到 ASCII 变量再拼文案，不要写 `...（${LINGTAI_QUEUE_DIR}）`：
+#   这一节曾整体抛 "LINGTAI_QUEUE_DIR: unbound variable"（就在这一行），
+#   而变量明明是 export 过的 —— 属于 lint 7' 记录的那类「bash 3.2 + 全角字符
+#   吞变量名」的坑，只是花括号形式没被 lint 的正则覆盖到。零成本规避：
+#   永远不让 $VAR 挨着全角字符。
+QDIR_SHOW="${LINGTAI_QUEUE_DIR:-UNSET}"
+case "${LINGTAI_QUEUE_DIR:-}" in
+  /tmp/lt-selftest-queue.*)
+    t_ok "自检队列已隔离到临时目录：$QDIR_SHOW" ;;
+  "")
+    t_fail "LINGTAI_QUEUE_DIR 未设置 —— 自检会直接写生产队列" ;;
+  *)
+    t_fail "自检队列指向了非临时目录：$QDIR_SHOW （有污染风险）" ;;
+esac
+
+# 24.2 生产队列的文件数必须与开跑前完全一致（一个都不许新增）
+PROD_PENDING_NOW="$(ls -1A "$PROD_PENDING" 2>/dev/null | wc -l | tr -d ' ')"
+check "生产队列 pending 无新增文件" "$PROD_PENDING_BASE" "$PROD_PENDING_NOW"
+
+# 24.3 生产队列里不许有「测试签名」条目（张三 / 你好 / 测试 …）
+#   注：队列文件名是 id（哈希或 st_*），所以必须比**内容**，不能比文件名。
+PROD_TESTHITS="$(grep -lE '张三|你好|测试' "$PROD_PENDING"/*.json 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"
+if [ -z "$PROD_TESTHITS" ]; then
+  t_ok "生产队列无自检假数据（无「张三/你好/测试」条目）"
+else
+  t_fail "生产队列混进自检假数据：${PROD_TESTHITS}（用户点「确认」会真的发出去）"
 fi
 
 # ── 总结 ────────────────────────────────────────────────────────

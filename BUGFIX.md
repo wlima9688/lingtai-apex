@@ -8,6 +8,51 @@
 
 ---
 
+## B-019 · 自检把假待确认项写进生产队列，菜单栏亮起 ⚠️1（用户以为程序坏了）
+
+- **日期**：2026-10-25（P14）
+- **优先级**：P1（假待确认项**能被点**，一点就真发消息；且用户第一眼以为软件坏了）
+- **症状**
+  - 桌面菜单栏图标从 `⚡️` 变成 `⚠️1`，点开是一项假待确认：
+    `{"title":"给张三 发微信","detail":"你好","risk":"对外发送（不可撤销）"}`
+  - `queue/pending/` 里出现过 `st_args_78957.json` / `st_args_81896.json`（`title=T`），
+    `queue/answered/` 里堆了 **211 个**全是自检产物（210 个 `st_*` + 1 个
+    `wx_*.test-artifact.json`），从 10-22 至今没有一个真实用户确认。
+- **根因（两层）**
+  1. `flashkit.swift` 的 `queueDir()` **硬编码** `~/.workbuddy/skills/mac-control/queue`，
+     没有任何出口 —— 自检 fork 出来的 `flash queue add` / `--selftest-confirm`
+     只能往生产队列写，**测试与生产共用一条队列**。
+  2. 自检只在 13.6 那条用 `rm -f` 手工擦自己写的文件，13.5
+     （`flash --selftest-confirm`）**从不清理**，`answer()` 把 pending 转成
+     answered 后永久留下；一旦某次自检中途挂掉，pending 里的假条目就留在那儿亮 ⚠️。
+- **修法**
+  1. `flashkit.swift`：`queueDir()` 认 `LINGTAI_QUEUE_DIR` 环境变量（非空即覆盖），
+     没设才回落到生产路径。
+  2. `selftest.sh`：`source common.sh` **之前** `export LINGTAI_QUEUE_DIR="$(mktemp -d /tmp/lt-selftest-queue.XXXXXX)/queue"`
+     + `mkdir pending answered`；清理串进**已有的** `trap '_finish; _cleanup_selftest_queue' EXIT`
+     （不能另起一条 `trap ... EXIT`，那会把恢复静音的 `_finish` 顶掉，电脑一直哑着）。
+  3. 新增第 24 节「队列隔离回归」三条断言：24.1 队列确实指到 `/tmp/lt-selftest-queue.*`、
+     24.2 生产 pending 文件数与开跑前快照一致、24.3 生产 pending 里没有含
+     「张三/你好/测试」的条目。13.9 改为显式盯**生产**路径。
+  4. 顺手修：自检里 lint 失败只报 `tail -3`，真正的失败项被截掉 —— 改成抓 `❌` 行。
+- **验证**
+  ```
+  红：生产 pending 里留 2 个 st_args_*.json →
+      13.9 ✗ 确认队列有残留文件：st_args_78957.json st_args_81896.json
+      24.3 ✗ 生产队列混进自检假数据：st_args_78957.json st_args_81896.json
+  绿：清掉后 → 通过 196 项，失败 0 项；pending=0；/tmp/lt-selftest-queue.* 已被 trap 删净
+  覆盖生效：LINGTAI_QUEUE_DIR=/tmp/p14-probe/queue flash queue stat → 目录: /tmp/p14-probe/queue
+  ```
+- **可复用教训**
+  1. **测试写的东西必须写到测试自己的地盘**。"改完记得清理"是靠不住的约定 ——
+     清理代码本身会失败、会被 kill、会被后加的分支绕过；**换目录**才是结构上的隔离。
+  2. **测试产物的第一个用户就是用户本人**。假待确认项不只是脏数据，它是一个
+     可点击的「确认」按钮，点下去真的发微信 —— 测试污染在这里等于**外部副作用**。
+  3. 断言要盯**生产目录**：13.9 原本就查 pending 是否为空，但队列被污染时它只是
+     "红了"；没有和"自检是否隔离"这件事对上，所以红了也没人去改架构。
+
+---
+
 ## B-018 · 录屏永远修不好：`tccutil reset` 之前没人先问"是不是已经好了"
 
 - **日期**：2026-10-25（P13）
