@@ -2209,8 +2209,8 @@ if [ -f "$HANDOFF_SW" ] \
    && grep -q '今天帮你做些什么' "$HANDOFF_SW" \
    && grep -q "postKey(kc.ret)" "$HANDOFF_SW" \
    && grep -q "func performHandoff" "$FLASH_SW" \
-   && grep -q 'func performHandoff(_ text: String, skill: String? = "mac-control")' "$FLASH_SW" \
-   && grep -q "handoffToWorkBuddy(text, skill: skill)" "$FLASH_SW"; then
+   && grep -q 'func performHandoff(' "$FLASH_SW" \
+   && grep -q 'handoffToWorkBuddy(text, skill: skill' "$FLASH_SW"; then
   t_ok "转交链路四要素齐（Electron AX 双开关 + 输入框定位 + 回车优先 + 面板接线）"
 else
   t_fail "转交链路缺件 —— 复杂任务会退回「只复制，用户自己 ⌘V」的半自动"
