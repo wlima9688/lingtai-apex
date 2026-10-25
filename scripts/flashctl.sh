@@ -296,8 +296,17 @@ case "$cmd" in
   #   全程只弹这一次；弹窗代码默认静默（见 ERR-0023）。
   ax)
     UID_N="$(id -u)"
+    # ⚠⚠ 守卫：已经授权就**什么都别做**。
+    #   本分支第一步是 `tccutil reset`，那会**主动清掉**现有授权。
+    #   用户手一抖跑一次，刚拿到的好授权就没了 —— 必须先判断。
+    if tr ' ' '\n' < /tmp/flash.hotkey 2>/dev/null | grep -q '^ax=1$'; then
+      echo "✅ 辅助功能已经是好的（ax=1），不需要修。"
+      echo "   本命令会先 tccutil reset 清授权，所以**不做任何操作**。"
+      echo "   真怀疑它坏了，先跑：$0 diagnose"
+      exit 0
+    fi
     if [ ! -f "$PLIST" ]; then
-      echo "❌ 还没注册开机自启（缺 $PLIST）"
+      echo "❌ 还没注册开机自启（缺 ${PLIST}）"
       echo "   先跑：$0 install   然后再跑 $0 ax"
       exit 1
     fi
