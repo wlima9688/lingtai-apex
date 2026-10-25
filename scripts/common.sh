@@ -73,10 +73,25 @@ lib_record() {
   return 0
 }
 
-T0=$(python3 -c 'import time;print(int(time.time()*1000))')
+# ⚠⚠ P15（2026-10-25）：毫秒时钟**不许再 fork python3**。
+#   原来 `T0=$(python3 -c 'import time;...')` 在 source 阶段就烧掉 ~240ms
+#   （实测：source common.sh 450ms → 210ms），而**每个脚本**都要 source 这一次。
+#   后果不是"慢一点"：route.sh 单次 1.06s 里有 0.24s 是这个，一次自检要
+#   fork 四五十次脚本 → 净亏 10s 以上；用户按热键的交互路径也白等 0.24s。
+#   perl 是 macOS 自带，同一个活只要 ~15ms。没有 perl 就退回秒级（够用）。
+if [ -x /usr/bin/perl ]; then
+  T0=$(/usr/bin/perl -MTime::HiRes=time -e 'printf "%.0f", time*1000')
+else
+  T0=$(( $(date +%s) * 1000 ))
+fi
 
 elapsed_ms() {
-  python3 -c "import time,sys;print(max(0,int(time.time()*1000)-int(sys.argv[1])))" "$T0"
+  if [ -x /usr/bin/perl ]; then
+    /usr/bin/perl -MTime::HiRes=time -e \
+      'my $d = time*1000 - $ARGV[0]; printf "%d", ($d < 0 ? 0 : $d)' "$T0"
+  else
+    echo $(( $(date +%s) * 1000 - T0 ))
+  fi
 }
 
 # ── JSON 构造 ───────────────────────────────────────────────────────

@@ -17,13 +17,14 @@
 | 声音大点 / 音量调到 N | `macctl volume --set N` | L0 | <1s | ✅ |
 | 一句话下达指令 / 随手指挥 | `scripts/route.sh "给张三发微信:你好"` | L0/L1 | <1s | ✅ 热键 ⌃⌥Space 唤起 flash |
 | 电脑能操作吗 / 环境检查 | `macctl doctor` | L0 | <2s | ✅ |
+| 自检（快速，日常） | `scripts/selftest.sh` | L0 | ≤60s | 跳过视觉/动画项 |
+| 自检（全量，大自检） | `scripts/selftest.sh --full` | L0 | ≤5min | 含动画视觉回归 |
 | 找 X 在哪 / X 的坐标 | `macctl locate --text "X"` | L0 | <1s | ✅ AX→OCR 自动降级 |
 | 转给 WorkBuddy / 这条你做不了 / 复杂任务 | `scripts/flash --handoff "原文" [--skill mac-control]` | L0 | ≤12s | ✅ 全自动：新建任务→粘贴→选技能→发送 |
 | 闪控支持什么 | 读本表 | — | — | — |
 
-**⚠️ 定位一律用 `macctl locate`，不要用 `macctl find`。**
-`find` 只有 AX 一条路，撞到自绘控件就报「找不到」；`locate` 会自动降级到 OCR 视觉定位
-（微信搜索框就是自绘控件，曾因此误判为「能力受限」，D-017 已打通）。
+**⚠️ 定位一律用 `macctl locate`，不要用 `macctl find`。** `find` 只有 AX 一条路，撞到自绘控件就报「找不到」；
+`locate` 会自动降级到 OCR 视觉定位（微信搜索框是自绘控件，曾因此误判「能力受限」，D-017 已打通）。
 
 脚本目录 `S=~/.workbuddy/skills/mac-control/scripts`，下表命令都按此路径调用。
 **用户不在电脑前时不用问要不要继续。** 直接调用——脚本会自动检测锁屏并快速返回原因。
@@ -130,8 +131,7 @@ $M find --text "发送" --app <id>       # 4 验证
 
 ## 五、持续优化
 
-**未命中意图** → 写 `proposals.jsonl`；**新App 交互模型** → `macctl note`；**加脚本** → `scripts/` 新建 +
-**路由表加一行** + 跑 `lint.sh`；**改完自检** → `selftest.sh`（170 项，静音）；**性能** → `bench.sh --runs 20`。
+**未命中意图** → 写 `proposals.jsonl`；**新App** → `macctl note`；**加脚本** → `scripts/` 新建 + **路由表加一行** + `lint.sh`；**改完自检** → `selftest.sh`（默认快速档 ~85s / `--full` 大自检 ≤5min，静音）；**性能** → `bench.sh --runs 20`。
 **改完 flash 面板** → 必跑 `flash --layout-check`；⚠ 窗口高度**不许手写**，`Layout.H` 必须由算式累加，否则加内容必溢出。
 
 **动手前先查**：`BUGFIX.md`（修复台账，症状→根因→修法→验证→教训，同类症状直接跳修法）、`DIAGNOSIS.md`、`references/engineering-rules.md`（铁律 + bash/Swift/AX 陷阱 +

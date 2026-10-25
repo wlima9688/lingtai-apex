@@ -453,7 +453,8 @@ tail -20 ~/.workbuddy/skills/mac-control/logs/$(date +%Y-%m-%d).jsonl   # 操作
 ```bash
 cd ~/.workbuddy/skills/mac-control/scripts
 ./lint.sh          # 路由表与代码的一致性（防漂移）
-./selftest.sh      # 79 项回归测试
+./selftest.sh      # 快速档回归（~86s，跳过视觉/动画项）
+./selftest.sh --full   # 全量档（≤5min，含动画/像素视觉回归）
 ```
 
 两个都过了才算改完。**闪控的工具会拦住你写错的坏模式** —— 开发期间它抓过 4 次自己写的坏代码。
@@ -543,7 +544,8 @@ locate --text "搜索" --app com.tencent.xinWeChat
 
 ```bash
 ./lint.sh        # 10 类检查：路由表双向一致、脚本契约、bash 变量边界、JSON 管道...
-./selftest.sh    # 177 项回归：AX 基础/OCR/locate/剧本/路由器/面板闭环/口语识别/启动置前/三维地球几何/场景闸门（含像素级回归与反向验证）
+./selftest.sh          # 快速档：AX 基础/OCR/locate/剧本/路由器/面板闭环/口语识别/lint/layout（跳过视觉与动画）
+./selftest.sh --full   # 全量档：再加上启动置前/三维地球像素回归/场景闸门/五角星视觉（含反向验证）
 ./bench.sh# 性能基线
 ```
 
@@ -593,7 +595,7 @@ $S/macctl overview              # 桌面全景
 $S/macctl ocr                   # 读屏
 
 # 质量
-cd $S && ./lint.sh && ./selftest.sh    # 改代码后必跑
+cd $S && ./lint.sh && ./selftest.sh    # 改代码后必跑（日常快速档；发布前 ./selftest.sh --full）
 ```
 
 **三层分工一句话记住**：

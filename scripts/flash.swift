@@ -396,12 +396,25 @@ struct RaiseOutcome {
 }
 
 /// 把「用户怎么说」解析成 bundle id，零副作用（只问地址，不启动）。
+///
+/// ⚠ P15：加进程内缓存。原来**每问一次就 fork 一次 macctl**，而建面板时
+///   14 个格子各问一次、「计算器」在自检里连问 5 次 —— 光这一项就白花
+///   好几秒（实测占 layout-check 2.4s 里的 1.6s）。同一进程内 App 不会
+///   凭空装/卸，缓存没有新鲜度问题。
+///   空串 = "解析过、但没有" —— 失败也缓存，别让不存在的 App 反复 fork。
+var _bundleIDCache: [String: String] = [:]
+
 func resolveBundleID(_ name: String) -> String? {
+    if let hit = _bundleIDCache[name] { return hit.isEmpty ? nil : hit }
     let s = runMacctl(["launch", "--name", name, "--resolve-only", "--json"])
     guard let d = s.data(using: .utf8),
           let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
           (o["ok"] as? Bool) == true,
-          let bid = o["bundle"] as? String, !bid.isEmpty else { return nil }
+          let bid = o["bundle"] as? String, !bid.isEmpty else {
+        _bundleIDCache[name] = ""
+        return nil
+    }
+    _bundleIDCache[name] = bid
     return bid
 }
 
@@ -521,7 +534,17 @@ func anyWindowVisible(pid: pid_t) -> Bool {
 
 /// 取某个 App 的**原始图标**（Dock 里那个），统一缩放到 18pt 供格子绘制。
 /// 解析不到（没装/名字对不上）就返回 nil，调用方退回 SF Symbol —— 不能因为图标缺失就不显示。
+///
+/// ⚠⚠ P15（2026-10-25）：`--layout-check` 里**必须**关掉图标解析。
+///   这不是"省一点"的优化，是那一项 18 秒的真正根因：
+///   `--layout-check` 只为验几何，却老老实实把 14 个格子挨个解析了一遍 ——
+///   每个 App 图标 = fork 一次 macctl（launch --resolve-only --json）+ 一次
+///   LaunchServices 查表，实测 874 个采样里有 869 个卡在"读子进程输出"。
+///   几何判据（越界/文字溢出/末行是否用满）一个都不依赖图标，跳过零损失。
+var ICONS_DISABLED = false
+
 func appIconImage(for name: String) -> NSImage? {
+    if ICONS_DISABLED { return nil }
     guard let bid = resolveBundleID(name),
           let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid) else {
         return nil
@@ -3201,6 +3224,8 @@ func runMain() {
     //   这里和用户点「→」时一样，先拿到激活权再降层，链路才一致。
     if let i = argv.firstIndex(of: "--selftest-handoff") {
         let text = i + 1 < argv.count ? argv[i + 1] : "闪控自检 · 转交链路"
+        // ⚠ P15：转交链路测的是「新建任务→粘贴→发送」，与格子图标无关。
+        ICONS_DISABLED = true
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         let panel = Panel.shared
@@ -3248,6 +3273,9 @@ func runMain() {
     //   用完 exit，窗口随进程消失，不留痕迹。
     if let i = argv.firstIndex(of: "--selftest-raise"), i + 1 < argv.count {
         let target = argv[i + 1]
+        // ⚠ P15：这条断言只判「谁在前台」，跟图标无关。建面板时若还去解析
+        //   14 个 App 图标（=14 次 macctl 子进程），5 轮就是白花 10 秒。
+        ICONS_DISABLED = true
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         let panel = Panel.shared
@@ -3291,6 +3319,9 @@ func runMain() {
 
     // ── 几何自检（不需要显示窗口，自检脚本会跑）─────────────
     if argv.contains("--layout-check") {
+        // ⚠ P15：纯算式校验不该等图标 —— 14 个 App 图标 = 14 次 macctl 子进程，
+        //   实测占了 2.4s 里的 1.6s。关掉后本项落到 0.3s 级（目标 ≤3s）。
+        ICONS_DISABLED = true
         exit(Int32(runLayoutCheck()))
     }
 

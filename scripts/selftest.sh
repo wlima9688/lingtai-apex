@@ -16,13 +16,235 @@
 #   9. lint 一致性
 #
 # 参数：
+#   （无参数）     快速档：≈60~85s，只跑逻辑/契约断言，视觉与动画项显式跳过
+#   --full         全量档（大自检）：≤5min，含动画/整屏截图/编译反证
 #   --quiet        只输出总结
 #   --keep-muted   结束后保持静音（默认恢复原状态）
+#   --no-lock-test 跳过第 25 节锁/防套娃单测（只给"验证断路器"的子层用）
 #
-# 退出：0 = 全部通过；1 = 有失败
+# 退出：0 = 全部通过；1 = 有失败；并发时第二份直接 exit 0（不算失败）
+#
+# ══ P15（2026-10-25）：自检提速 ═══════════════════════════════════════
+# 用户原话：「每次自检都耗时耗精力，下次除了我要求大自检以外，其他时候
+#   自检必须精准精确，快速高效」。P14 那次跑了 25 分钟，原因是三条：
+#   ① 默认档就跑「播开场动画 + sleep 15 + 整屏截图」的视觉项（单条 25s 起，
+#      动画没起来还会重试 3 轮 → 滚成 25 分钟）；
+#   ② 没有任何并发锁 —— 两份同时在跑会互抢 splash 窗口，视觉断言全红，
+#      各自再重试，时间翻倍；
+#   ③ 慢在哪没人知道（没有分段计时）。
+# 这一版：默认只跑快速档（视觉项**显式跳过并计数**，绝不静默）、加并发锁、
+#   加分段计时 + 最慢 5 项。断言一条没删 —— 全量档照跑。
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$DIR/.." && pwd)"
+
+# ══ P15b（2026-10-25 打回）：防套娃三层防线 ═════════════════════════
+# 事故现场：自检会起自检，越套越深 —— 同时刻 3~5 份 selftest.sh、cpu≈0%、
+#   30 分钟不结束，只能手动 `pkill -f selftest\.sh` 止血。
+# 根因不是"锁写错了"，是**锁的判据选了错的维度**：`kill -0 <持锁人>` 只能回答
+#   "那个 pid 还活着吗"，回答不了"这个 pid 是不是我自己这条链上的" —— 而子自检
+#   恰恰就是持锁人的**后代**，于是锁一路放行，每层再起一层。
+# 三层防线（按生效顺序，缺一不可）：
+#   ① SELFTEST_DEPTH 断路器 —— 唯一不依赖锁状态的防线。锁坏了 / pid 被复用 /
+#      stale 接管失手，都拦不住"我这条链上的子进程"，depth 一定拦得住。
+#      语义：进入时 (incoming+1) ≥ 2 立即退出 → 顶层 0→1 跑，子层 1→2 必拒。
+#   ② 祖先识别 —— 抢锁失败时先问"持锁进程是不是我的祖先"：是 → 我是它起的
+#      子自检 → 直接退。"并发"和"嵌套"是两件事，必须分开判。
+#   ③ 防套娃回归断言 —— 第 25 节：运行期实例数必须恒为 1，否则报红并列 pid 链。
+SELFTEST_MAX_DEPTH=2
+
+# 纯函数（第 25 节直接单测它，不再 fork 整份脚本）：算下一层深度，返回 0=放行
+_depth_next() {  # _depth_next <incoming> → stdout: 下一层深度；exit 0 放行 / 1 拒绝
+  local d="${1:-0}" n
+  case "$d" in ''|*[!0-9]*) d=0 ;; esac
+  n=$((d + 1))
+  printf '%s' "$n"
+  [ "$n" -lt "$SELFTEST_MAX_DEPTH" ]
+}
+
+_depth_in="${SELFTEST_DEPTH:-0}"
+case "$_depth_in" in ''|*[!0-9]*) _depth_in=0 ;; esac
+if ! _depth_next "$_depth_in" >/dev/null; then
+  echo "⛔ 嵌套过深（SELFTEST_DEPTH=${_depth_in} → $((_depth_in + 1)) ≥ ${SELFTEST_MAX_DEPTH}）：本次立即退出，绝不再起一份自检"
+  exit 0
+fi
+# 必须 export：子进程（含任何被自检 fork 出来的 shell）靠它做断路器判据
+export SELFTEST_DEPTH="$(_depth_next "$_depth_in")"
+
+# 沿 ppid 往上找：<pid> 是不是我的祖先（含自身）
+# ⚠ 三层兜底，缺一不可（P15b 实测）：
+#   ① 自身：纯变量比较，零成本；
+#   ② 直系父（$PPID）：bash 内建，**不需要 ps** —— 而事故现场（第 3 层 = 第 2 层
+#      起的子自检）恰好就是这一层，这一条命中率最高；
+#   ③ 更上层：只有 ps 可用时才走。WorkBuddy 的沙箱里 `ps` 被禁
+#      （实测 "Operation not permitted"，连自己的 pid 都查不了），此时 ③ 静默降级，
+#      绝不能因为 ps 失败就判成"不是祖先"而放行。
+_is_ancestor() {
+  local target="$1" p=$$ n=0
+  case "$target" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$p" = "$target" ] && return 0
+  [ "${PPID:-}" = "$target" ] && return 0
+  while [ "$n" -lt 40 ]; do
+    [ "$p" -le 1 ] 2>/dev/null && return 1
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$p" = "$target" ] && return 0
+    n=$((n + 1))
+  done
+  return 1
+}
+
+# 纯函数：锁裁决（不产生任何动作 → 可单测）。ANCESTOR 优先于 ALIVE：
+#   祖先既"活着"又"是我这条链上的"，必须判成嵌套，否则就是炸弹的入口。
+_lock_verdict() {  # _lock_verdict <pid> → ANCESTOR | ALIVE | DEAD
+  case "$1" in ''|*[!0-9]*) echo DEAD; return 0 ;; esac
+  if _is_ancestor "$1"; then echo ANCESTOR; return 0; fi
+  if kill -0 "$1" 2>/dev/null; then echo ALIVE; return 0; fi
+  echo DEAD
+}
+
+# ══ 实例登记簿：防套娃断言的唯一事实源 ════════════════════════════════
+# 为什么不用 `pgrep -f selftest\.sh | wc -l`：这个数字在本机**天然偏大** ——
+#   任何"命令行里提到 selftest.sh"的父壳都会被算成一份自检。实测：
+#   `zsh -c '... ./selftest.sh ...'` 这种拉起方式下 pgrep 数是 2，真在跑的只有 1；
+#   更要命的是沙箱里 `ps` 被禁（连自己的 ppid 都查不出来），没法把祖先排除。
+# 所以：每个实例抢到锁后在自己的登记簿留一个 `<pid>` 空文件，退出时删；
+#   断言数**登记簿里还活着的条目** —— 只有自检进程会往里写，语义精确。
+INST_DIR="/tmp/lingtai-selftest.inst"
+mkdir -p "$INST_DIR" 2>/dev/null
+_inst_prune() {   # 清掉已死实例的登记（kill -9 会留垃圾，不清就会越积越多）
+  local f p
+  for f in "$INST_DIR"/*; do
+    [ -f "$f" ] || continue
+    p="$(basename "$f")"
+    case "$p" in ''|*[!0-9]*) rm -f "$f" 2>/dev/null; continue ;; esac
+    kill -0 "$p" 2>/dev/null || rm -f "$f" 2>/dev/null
+  done
+  return 0
+}
+_inst_pids() {
+  _inst_prune
+  local f out=""
+  for f in "$INST_DIR"/*; do
+    [ -f "$f" ] && out="$out $(basename "$f")"
+  done
+  printf '%s' "${out# }"
+}
+_inst_count() {
+  local l
+  l="$(_inst_pids | tr ' ' '\n' | grep -c . 2>/dev/null)"
+  printf '%s' "${l:-0}"
+}
+
+# 持锁人"长得像不像自检进程"——`kill -0` 只回答"pid 在不在"，回答不了
+#   "这个 pid 还是当初那个自检吗"。两种常见误判都靠它兜住：
+#   ① 自检被 kill -9 后变僵尸，pid 仍在（kill -0 成功）→ 锁永久哑火；
+#   ② 自检退出后 pid 被系统复用给别的进程（kill -0 成功）→ 同样永久哑火。
+#   两种都表现为「每次都 ⏳ 已有一份在跑」，而实际什么都没在跑。
+#   判据 = 登记簿里有它的名字（活的实例一定登记过）；pgrep 只作兜底，
+#   兼容"改造前就在跑的旧版实例"（旧版不写登记簿）。
+_looks_like_selftest() {
+  local pid="$1" p
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  _inst_prune   # 先清死登记，否则"死人不删名"会变成另一种永久哑火
+  [ -f "$INST_DIR/$pid" ] && return 0
+  for p in $(pgrep -f "[s]elftest\.sh" 2>/dev/null); do
+    [ "$p" = "$pid" ] && return 0
+  done
+  return 1
+}
+
+# ══ 并发锁：同一时刻只允许一份自检 ════════════════════════════════════
+# ⚠ 用 mkdir 不是 flock：macOS 自带没有 flock(1)。mkdir 的原子性足够，
+#   且失败即"已有人持锁"，语义正好。
+# ⚠ 必须**最先**抢锁（在任何 mktemp 之前）：第二份被拒时不该留下临时目录。
+# ⚠ 退出码是 0 不是 1：并发不是失败，别让上层把"已经在跑了"误报成"自检红了"。
+SELFTEST_LOCK="/tmp/lingtai-selftest.lock"
+# 抢到锁之后**复核**：僵尸接管时两个进程可能都以为自己赢了（见下面 mv 的注释）
+_lock_acquired() {
+  echo $$ > "$SELFTEST_LOCK/pid"
+  [ "$(cat "$SELFTEST_LOCK/pid" 2>/dev/null)" = "$$" ]
+}
+# 读 pid 文件：mkdir 成功与写 pid 之间有**微秒级空隙**，此间读到空不能当僵尸。
+#   P15 实测：两份同时起，B 读到空 → 判僵尸 → mv 接管 → 两份都在跑（3~5 份的由来）。
+#   修法：读空先重试 8×100ms（远大于写一行 pid 的耗时），仍空才算僵尸。
+_read_lock_pid() {
+  local i=0 lp=""
+  while [ "$i" -lt 8 ]; do
+    lp="$(cat "$SELFTEST_LOCK/pid" 2>/dev/null || true)"
+    [ -n "$lp" ] && { printf '%s' "$lp"; return 0; }
+    sleep 0.1 2>/dev/null || sleep 1
+    i=$((i + 1))
+  done
+  return 0
+}
+if ! mkdir "$SELFTEST_LOCK" 2>/dev/null; then
+  LOCK_PID="$(_read_lock_pid)"
+  LOCK_VERDICT="$(_lock_verdict "$LOCK_PID")"
+  # ② 祖先识别：持锁人是我的祖先进程 → 我是它起的子自检，绝不能再跑
+  if [ "$LOCK_VERDICT" = "ANCESTOR" ]; then
+    echo "⏳ 嵌套调用（祖先 pid ${LOCK_PID} 正在跑自检），本次退出"
+    exit 0
+  fi
+  if [ "$LOCK_VERDICT" = "ALIVE" ] && ! _looks_like_selftest "$LOCK_PID"; then
+    # pid 活着但不是自检 → 僵尸残留或 pid 被系统复用 → 按僵尸锁处理，否则永久哑火
+    echo "🔧 持锁 pid ${LOCK_PID} 已不是自检进程（僵尸或 pid 复用），按僵尸锁接管"
+    LOCK_VERDICT="DEAD"
+  fi
+  if [ "$LOCK_VERDICT" = "ALIVE" ]; then
+    echo "⏳ 已有一份自检在跑（pid ${LOCK_PID}），本次退出"
+    exit 0
+  fi
+  # 僵尸锁（持锁进程已死 / pid 文件空）：接管。
+  # ⚠ 没有这一步，一次 kill -9 就会让自检永久哑火 —— 而且哑得更隐蔽：
+  #   每次都「⏳ 已有一份在跑」然后 exit 0，看起来一切正常。
+  # ⚠⚠ 接管必须用 mv（原子 rename），不能 `rm -rf` 后 mkdir：两个进程同时接管
+  #   时，A 的 rm 会把 B 刚建好的锁删掉 → 两边都进去跑。P15 实测撞到过
+  #   （三个自检并发，互抢 splash 窗口）。mv 只有一个能成功，天然互斥。
+  if mv "$SELFTEST_LOCK" "$SELFTEST_LOCK.stale.$$" 2>/dev/null; then
+    rm -rf "$SELFTEST_LOCK.stale.$$"
+  fi
+  if ! mkdir "$SELFTEST_LOCK" 2>/dev/null || ! _lock_acquired; then
+    LOCK_PID="$(_read_lock_pid)"
+    echo "⏳ 已有一份自检在跑（pid ${LOCK_PID:-未知}），本次退出"
+    exit 0
+  fi
+else
+  _lock_acquired
+fi
+# 登记我自己（防套娃断言据此数"真在跑几份"）
+: > "$INST_DIR/$$" 2>/dev/null
+
+# ══ 防套娃采样器（第 25 节消费，mark() 每 5 个小节采一次）══════════════
+# 报红时把每个实例的 pid/ppid/命令行都列出来 —— 只说"有 2 份"等于什么都没说。
+# ⚠ ps 在沙箱里被禁时这一段会是空的，所以 pid 列表本身必须从登记簿取。
+_nest_chain() {
+  local p out=""
+  for p in $(_inst_pids); do
+    out="${out}pid=${p} $(ps -o ppid=,command= -p "$p" 2>/dev/null | sed 's/^ *//' | cut -c1-100) | "
+  done
+  printf '%s' "${out:-（ps 不可用，仅登记簿：$( _inst_pids )）}"
+}
+NEST_SAMPLES=0
+NEST_MAX=0
+NEST_PGREP_MAX=0
+NEST_LOG=""
+_nest_probe() {
+  local n np
+  n="$(_inst_count)"
+  # 顺带记一下同一时刻 `pgrep -f selftest\.sh` 会数出几个：这个数字**天然偏大**，
+  #   因为 bash 每 fork 一个子壳（`$(...)`、`( ) &`、管道）都继承同一份 argv，
+  #   pgrep 会把它当成"另一份自检"。留这个数是为了下次有人拿 pgrep 当判据时，
+  #   断言自己就能解释清楚差在哪，而不是又去怀疑"是不是又套娃了"。
+  np="$(pgrep -f "[s]elftest\.sh" 2>/dev/null | wc -l | tr -d ' ')"
+  [ "${np:-0}" -gt "${NEST_PGREP_MAX:-0}" ] 2>/dev/null && NEST_PGREP_MAX="$np"
+  NEST_SAMPLES=$((NEST_SAMPLES + 1))
+  [ "$n" -gt "$NEST_MAX" ] 2>/dev/null && NEST_MAX="$n"
+  if [ "$n" -gt 1 ] 2>/dev/null; then
+    NEST_LOG="${NEST_LOG}[采样${NEST_SAMPLES} 实例数=${n}：$(_nest_chain)] "
+  fi
+  return 0
+}
 # 自检日志隔离：测试故意触发的失败不能污染用户审计日志/复盘统计
 export SHANKONG_LOG_DIR="$(mktemp -d -t shankong_selftest_logs)"
 SELFTEST_LOG_DIR="$SHANKONG_LOG_DIR"
@@ -59,15 +281,55 @@ MACCTL_SRC="$DIR/macctl.swift"
 
 QUIET=0
 KEEP_MUTED=0
+FULL=0            # 0 = 快速档（默认）；1 = 全量档（--full，大自检）
+LOCK_TEST=1       # 1 = 跑第 25 节的锁/防套娃单测；0 = --no-lock-test（断路器验证用）
 while [ $# -gt 0 ]; do
   case "$1" in
+    --full) FULL=1; shift ;;
     --quiet) QUIET=1; shift ;;
     --keep-muted) KEEP_MUTED=1; shift ;;
+    # ⚠ 给"真起子层"的那条断路器验证用：子层自己不需要再验一遍锁，
+    #   否则又是一条"自检里跑自检"的路径（哪怕有 depth 断路器也不该依赖它兜底）。
+    --no-lock-test) LOCK_TEST=0; shift ;;
     *) shift ;;
   esac
 done
 
 PASS=0; FAIL=0
+SKIPPED=0
+SKIPPED_LIST=""
+
+# ══ 分段计时（P15）══════════════════════════════════════════════════
+# 目的只有一个：**谁变慢了一眼看得出**。以前只知道"自检慢"，不知道慢在
+# 哪一条，于是每次优化都在猜。现在每进一个小节 mark 一次，结尾按耗时倒序
+# 打印前 5 名。
+# ⚠ 毫秒精度靠 perl：macOS 的 date 不支持 %N，bash 3.2 也没有 EPOCHREALTIME。
+#   单次约 15ms，全脚本 mark 三四十次 → 半秒开销，换个可观测性完全值。
+_now_ms() {
+  perl -MTime::HiRes=time -e 'printf "%.0f", time*1000' 2>/dev/null \
+    || printf '%s000' "$(date +%s)"
+}
+SEG_FILE="$(mktemp /tmp/lt-selftest-seg.XXXXXX)"
+T_START="$(_now_ms)"
+SEG_T="$T_START"
+NEST_TICK=0
+mark() {  # mark <刚结束的小节名>：结算"上一段"，并开新的一段
+  local _now _d
+  _now="$(_now_ms)"
+  _d=$(( _now - SEG_T ))
+  SEG_T="$_now"
+  [ "$_d" -ge 0 ] && printf '%s\t%s\n' "$_d" "${1:-未命名}" >> "$SEG_FILE"
+  # ══ P15b：顺带采一次"同时在跑几份自检"（全程约 7 个采样点，单次 ~20ms）
+  # 第 25 节的断言消费这些采样：max > 1 就是递归炸弹复活，立刻红。
+  NEST_TICK=$((NEST_TICK + 1))
+  [ $((NEST_TICK % 5)) -eq 0 ] && _nest_probe
+  return 0
+}
+skip_fast() {  # skip_fast <项名>：快速档显式跳过（绝不允许静默跳过）
+  SKIPPED=$((SKIPPED + 1))
+  SKIPPED_LIST="${SKIPPED_LIST}${1}；"
+  say "  ⊘ 跳过（快速档）：$1"
+}
 say()  { [ "$QUIET" = "1" ] || echo "$@"; }
 t_ok()  { PASS=$((PASS+1)); say "  ✓ $1"; }
 t_fail(){ FAIL=$((FAIL+1)); say "  ✗ $1"; }
@@ -79,8 +341,42 @@ check() { # check <描述> <期望> <实际>
 silence_guard_on
 say "🔇 静音守卫生效（原始静音状态=${_SILENCE_ORIG}）"
 
-# 结束时恢复（除非 --keep-muted）
+# 结束时恢复（除非 --keep-muted）+ 释放并发锁 + 打印分段耗时
+TIMING_PRINTED=0
+_print_timing() {
+  [ "$TIMING_PRINTED" = "1" ] && return 0
+  TIMING_PRINTED=1
+  mark "收尾"
+  local _total _mode
+  _total=$(( ($(_now_ms) - T_START) / 1000 ))
+  _mode="快速档"
+  [ "$FULL" = "1" ] && _mode="全量档"
+  printf '\n⏱ 总耗时 %ss（%s；跳过 %s 项）\n' "$_total" "$_mode" "$SKIPPED"
+  if [ -s "$SEG_FILE" ]; then
+    printf '⏱ 最慢 5 项：\n'
+    sort -rn "$SEG_FILE" 2>/dev/null | head -5 \
+      | awk -F'\t' '{printf "    %5.1fs  %s\n", $1/1000, $2}'
+    # 排查用：LINGTAI_SELFTEST_TIMING=all ./selftest.sh → 打全部小节（倒序）
+    if [ "${LINGTAI_SELFTEST_TIMING:-}" = "all" ]; then
+      printf '⏱ 全部小节（倒序）：\n'
+      sort -rn "$SEG_FILE" 2>/dev/null \
+        | awk -F'\t' '{printf "    %5.1fs  %s\n", $1/1000, $2}'
+    fi
+  fi
+  [ -n "${SKIPPED_LIST:-}" ] && printf '⏱ 跳过清单：%s\n' "$SKIPPED_LIST"
+  rm -f "$SEG_FILE"
+  return 0
+}
+_release_lock() {
+  # 只释放自己持有的锁：僵尸接管的场景下，别把新持锁人的锁删掉
+  local _p
+  _p="$(cat "$SELFTEST_LOCK/pid" 2>/dev/null || true)"
+  [ "$_p" = "$$" ] && rm -rf "$SELFTEST_LOCK"
+  rm -f "${INST_DIR:-/tmp/lingtai-selftest.inst}/$$" 2>/dev/null
+  return 0
+}
 _finish() {
+  _print_timing
   if [ "$KEEP_MUTED" = "1" ]; then
     say "🔇 保持静音（--keep-muted）"
   else
@@ -88,6 +384,8 @@ _finish() {
     say "🔊 已恢复原声音状态"
   fi
   [ -n "${SELFTEST_LOG_DIR:-}" ] && rm -rf "$SELFTEST_LOG_DIR"
+  [ -n "${RD_CACHE:-}" ] && rm -rf "$RD_CACHE"
+  _release_lock
 }
 
 # 临时队列无条件清掉：成功/失败/被 Ctrl-C 都得走，别在 /tmp 堆垃圾。
@@ -115,6 +413,7 @@ else
 fi
 
 # ── 2. macctl JSON 契约 ─────────────────────────────────────────
+mark "1. 环境依赖"
 say "--- 2. macctl JSON 契约 ---"
 J="$(mj apps --json)"
 CNT="$(printf '%s' "$J" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("count",-1))' 2>/dev/null)"
@@ -135,6 +434,7 @@ else
 fi
 
 # ── 3. common.sh JSON 构造 ──────────────────────────────────────
+mark "2. macctl JSON 契约"
 say "--- 3. common.sh JSON 构造 ---"
 E="$(emit 1 "test" "目标" 0 "证据" "" 2>&1)"
 if printf '%s' "$E" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True and d["action"]=="test" and d["error_code"] is None' 2>/dev/null; then
@@ -158,6 +458,7 @@ else
 fi
 
 # ── 4. 脚本参数校验分支（不发声、不动界面）─────────────────────
+mark "3. common.sh JSON 构造"
 say "--- 4. 脚本参数校验 ---"
 R="$(bash "$DIR/open_file.sh" 2>&1)"
 if printf '%s' "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is False and d["error_code"]=="ELEMENT_NOT_FOUND"' 2>/dev/null; then
@@ -173,6 +474,7 @@ else
 fi
 
 # ── 5. 黑名单（SR-1）────────────────────────────────────────────
+mark "4. 脚本参数校验"
 say "--- 5. 黑名单拦截 ---"
 if blacklist_check "com.apple.Passwords" "钥匙串"; then
   t_ok "钥匙串命中黑名单"
@@ -186,6 +488,7 @@ else
 fi
 
 # ── 6. 密码红线（SR-2）──────────────────────────────────────────
+mark "5. 黑名单拦截"
 say "--- 6. 密码红线 ---"
 if is_password_field "你的验证码是 8392"; then
   t_ok "验证码内容命中密码红线"
@@ -199,6 +502,7 @@ else
 fi
 
 # ── 7. 审计日志（SR-3）──────────────────────────────────────────
+mark "6. 密码红线"
 say "--- 7. 审计日志 ---"
 LOGF="$LOG_DIR/$(date +%Y-%m-%d).jsonl"
 BEFORE=$(wc -l < "$LOGF" 2>/dev/null || echo 0)
@@ -216,6 +520,7 @@ else
 fi
 
 # ── 8. 静音守卫有效性 ───────────────────────────────────────────
+mark "7. 审计日志"
 say "--- 8. 静音守卫 ---"
 M="$(m volume --json | python3 -c 'import json,sys; print(json.load(sys.stdin).get("muted"))' 2>/dev/null)"
 if [ "$M" = "True" ] || [ "$M" = "true" ]; then
@@ -225,6 +530,7 @@ else
 fi
 
 # ── 9. lint 一致性 ─────────────────────────────────────────────
+mark "8. 静音守卫"
 say "--- 9. lint 一致性 ---"
 if bash "$DIR/lint.sh" >/dev/null 2>&1; then
   t_ok "lint 通过"
@@ -239,6 +545,7 @@ fi
 # 这一组每一条都对应一个真实排查 hours 的 bug。它们的共同特征是：
 # **上层把「工具层故障」误读成「业务对象不存在」**，排查方向完全跑偏。
 # 所以核心是保证工具层的失败必须**显式报错**，而不是静默返回空串。
+mark "9. lint 一致性"
 say "--- 10. 回归：历史踩坑防线 ---"
 
 # 10.1 --out 复用同一路径时内容叠加（曾产生 "Extra data: line 2"）
@@ -253,6 +560,7 @@ else
 fi
 rm -f "$RT" 2>/dev/null
 
+mark "10.1 --out 复用同一路径时内容叠加"
 # 10.2 json_query 传入 Python 表达式（而非函数名）必须报错，不能静默返回空
 ERRF="$(mktemp -t reflex_bad)"
 "$MACCTL" state --app com.kugou.mac.Music --depth 8 --json --out "$ERRF" >/dev/null 2>&1
@@ -265,6 +573,7 @@ else
 fi
 rm -f "$ERRF" 2>/dev/null
 
+mark "10.2 json_query 传入 Python 表达式"
 # 10.3 parsers.py 关键解析器必须存在（防止重构时误删）
 MISSING=""
 for fn in ax_count search_box song_suggestion song_result song_row_click now_playing; do
@@ -275,6 +584,7 @@ sys.exit(0 if '$fn' in parsers.FUNCS else 1)" 2>/dev/null || MISSING="${MISSING}
 done
 check "parsers.py 关键解析器齐全" "" "$MISSING"
 
+mark "10.3 parsers.py 关键解析器必须存在"
 # 10.4 song_suggestion 必须优先返回纯歌名（实测：选歌手会选中翻唱版）
 #用构造数据验证，不依赖酷狗当前状态
 SUGJ=$(python3 -c '
@@ -287,6 +597,7 @@ d={"nodes":[
 print(parsers.song_suggestion(d,"美丽的神话"))')
 check "song_suggestion 优先纯歌名（不猜歌手）" "40 123 1139 36" "$SUGJ"
 
+mark "10.4 song_suggestion 必须优先返回纯歌名"
 # 10.5 song_result 必须把原唱排到 remix 版本之前
 RESJ=$(python3 -c '
 import sys; sys.path.insert(0,"'"$DIR"'")
@@ -297,6 +608,7 @@ d={"nodes":[
 print(parsers.song_result(d,"美丽的神话"))')
 check "song_result 原唱优先于 DJ 版" "40 676 1139 71" "$RESJ"
 
+mark "10.5 song_result 必须把原唱排到 remix "
 # 10.6 now_playing 必须锁定播放条水平带，不能读到播放列表里的无关文本
 NPJ=$(python3 -c '
 import sys; sys.path.insert(0,"'"$DIR"'")
@@ -308,6 +620,7 @@ d={"windows":[{"x":370,"y":696,"w":700,"h":90,"title":""},{"x":40,"y":25,"w":113
 print(parsers.now_playing(d))')
 check "now_playing 只认播放条水平带" "美丽的神话 - 孙楠、韩红" "$NPJ"
 
+mark "10.6 now_playing 必须锁定播放条水平带，不能读"
 # 10.7 app_running 必须真的返回布尔退出码
 #（曾有脚本用 `$(... | python3 -c 'sys.exit(0 if...else 1)')` 存返回值，
 #   拿到的是 stdout 空串而非退出码 → 失败分支形同虚设）
@@ -322,12 +635,14 @@ print(a[0].get("bundle","") if a else "")' "$_f" 2>/dev/null)"; rm -f "$_f" 2>/d
 if [ -n "$_RUNA" ] && app_running "$_RUNA"; then t_ok "app_running 对运行中的应用返回 0"; else t_fail "app_running 对已运行应用返回非 0"; fi
 if app_running "com.example.absolutely.not.running"; then t_fail "app_running 对不存在应用返回 0"; else t_ok "app_running 对不存在应用返回非 0"; fi
 
+mark "10.7 app_running 必须真的返回布尔退出码"
 # 10.8 所有脚本不得残留「管道传大 JSON」的写法
 PIPEHIT="$(grep -ln 'mj .*| python3\|mj state .*| python3' \
   "$DIR"/route.sh "$DIR"/open_file.sh "$DIR"/music_play.sh \
   "$DIR"/wechat_send.sh "$DIR"/douyin_open.sh "$DIR"/screen_rec.sh 2>/dev/null | tr '\n' ' ')"
 check "无残留的管道式 JSON 解析" "" "$PIPEHIT"
 
+mark "10.8 所有脚本不得残留「管道传大 JSON」的写法"
 # 10.9 in_chat_with 必须靠输入框 title 判断，不能靠窗口 title
 #（实测微信窗口 title恒为「微信」，据此判断永远返回 no）
 IC1=$(python3 -c '
@@ -346,6 +661,7 @@ t={"windows":[{"x":732,"y":36,"w":708,"h":775,"title":"微信"}],
 print(parsers.in_chat_with(t,"文件传输助手"))')
 check "in_chat_with 非目标会话返回 no" "no" "$IC2"
 
+mark "10.9 in_chat_with 必须靠输入框 title "
 # 10.10 wechat_search_value 必须把占位符「搜索」视为空
 WSV=$(python3 -c '
 import sys; sys.path.insert(0,"'"$DIR"'")
@@ -354,6 +670,7 @@ t={"nodes":[{"role":"AXTextArea","x":828,"y":55,"w":100,"h":18,"title":"搜索",
 print(repr(parsers.wechat_search_value(t)))')
 check "wechat_search_value 不把占位符当内容" "''" "$WSV"
 
+mark "10.10 wechat_search_value 必须把占位符"
 # 10.11 所有需模拟输入的脚本都必须有环境预检（防锁屏静默失败）
 # ⚠ open_file.sh 故意不在列表里（D-022）：它全程只用 `open`（LaunchServices API），
 #   不模拟任何输入事件。对它做「光标能否移动」的预检属于**假阻塞**——
@@ -366,6 +683,7 @@ for f in music_play.sh douyin_open.sh wechat_send.sh; do
 done
 check "需输入的脚本都有环境预检" "" "$MISSING2"
 
+mark "10.11 所有需模拟输入的脚本都必须有环境预检"
 # 10.11b 反向断言：不需要输入的脚本**不该**有预检
 #⚠ 这条防的是回归：把 open_file.sh 加回预检列表会让它重新被假阻塞拦住。
 # ⚠ 断言必须**排除注释行**：我解释「为什么不该有预检」的注释里
@@ -377,6 +695,7 @@ else
   t_ok "open_file.sh 无环境预检（不需要模拟输入，不该被光标探测拦住）"
 fi
 
+mark "10.11b 反向断言"
 # 10.12 macctl doctor 必须存在且输出合法 JSON
 DOCT="$("$MACCTL" doctor --json 2>/dev/null)"
 if printf '%s' "$DOCT" | python3 -c '
@@ -390,6 +709,7 @@ else
   t_fail "macctl doctor 输出异常：${DOCT:0:120}"
 fi
 
+mark "10.12 macctl doctor 必须存在且输出合法 JS"
 # 10.13 锁屏时必须在 2 秒内快速失败（不能白等十几秒后报错误原因）
 LOCKED=$("$MACCTL" doctor --json 2>/dev/null | python3 -c '
 import json,sys
@@ -417,6 +737,7 @@ else
   t_ok "当前未锁屏（跳过锁屏预检测试）"
 fi
 
+mark "10.13 锁屏时必须在 2 秒内快速失败"
 # 10.14 doctor 的锁屏判据必须是「实测输入通道」，不能是「loginwindow 进程存在」
 #   回归防线（D-013）：loginwindow 是常驻进程，解锁后依然在跑。
 #   用它当判据会导致「屏幕明明解锁却报已锁定」，且会屏蔽掉唯一的可靠证据（输入自检）。
@@ -452,6 +773,7 @@ else
   t_ok "跳过判据检查（未找到 macctl.swift）"
 fi
 
+mark "10.14 doctor 的锁屏判据必须是「实测输入通道」，不能"
 # 10.15 当前环境下doctor 必须与实测一致（解锁时应报 locked=false）
 CUR_LOCKED="$("$MACCTL" doctor --json 2>/dev/null | python3 -c '
 import json,sys
@@ -473,6 +795,7 @@ esac
 #   而 MACCTL 是可执行文件路径，两回事，别混。
 MACCTL_SRC="$DIR/macctl.swift"
 
+mark "10. 回归：历史踩坑防线"
 # ── 11. locate 四级降级定位（D-015/D-016/D-017 的防线）────────────
 #⚠ 这些不是「风格检查」，是**能力存在性**检查：
 #   locate 是闪控唯一的通用定位入口，若它坏掉，微信搜索等能力会静默失效。
@@ -549,6 +872,7 @@ else
   t_fail "wechat_send 搜索框定位没有 OCR 降级"
 fi
 
+mark "11. locate 四级降级定位"
 # ── 12. route.sh 路由器 + flash 热键入口 ─────────────────────
 # ⚠ 这两个是「入口」，坏了用户就完全没法下达指令 —— 属于最高危的能力缺失。
 #   但它们的验证**绝不能真的执行**（不能真发微信、真改音量），
@@ -665,6 +989,7 @@ else
   t_fail "plist 里的 flash 路径不对 —— 重启后热键会失效"
 fi
 
+mark "12. route.sh 路由器"
 # ── 13. v2仪表盘闭环（这三个 bug 曾让闪控「看起来能点、实际全废」）────
 say "--- 13. v3 面板（无确认闸架构）---"
 
@@ -793,7 +1118,31 @@ fi
 # ⚠ 用户实测反馈：「一定要固定格式，超出格式就无法解析」。
 #   只靠加固定句式是打地鼠——所以要有兜底层，且必须用**口语**验，验的
 #   必须是路由器的真实输出，不能只看代码里有没有那个分支。
-route_dry() { "$DIR/route.sh" --dry-run "$1" 2>&1 | grep -E "^动作:" | head -1; }
+# ══ P15：只读路由解析的并发预热 ═══════════════════════════════════════
+# 为什么：`route.sh --dry-run` 单次 0.9~2.2s（bash 启动 + source common.sh +
+#   150 条正则匹配，未命中还要走兜底层）。断言要跑十几条，串起来就是 15~20s ——
+#   而它们**全是只读解析**（--dry-run 只 emit 一句 JSON，不执行任何动作），
+#   彼此独立。所以：一次并发跑完，断言时直接读结果。
+# ⚠ 只对 --dry-run 这么做。会真的执行动作的 route 调用**必须串行**：
+#   并发跑「截图/音量/打开微信」会互相抢状态，红得莫名其妙。
+# ⚠ 缓存键用查询原文的 md5；没预热的查询当场跑（任何调用点都能用）。
+RD_CACHE="$(mktemp -d /tmp/lt-rd.XXXXXX)"
+rd_key() { printf '%s' "$1" | md5 -q 2>/dev/null || printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'; }
+rd_prefetch() {
+  local q
+  for q in "$@"; do
+    (
+      "$DIR/route.sh" --dry-run "$q" >"$RD_CACHE/$(rd_key "$q")" 2>&1
+    ) &
+  done
+  wait
+  return 0
+}
+rd() {
+  local f="$RD_CACHE/$(rd_key "$1")"
+  if [ -f "$f" ]; then cat "$f"; else "$DIR/route.sh" --dry-run "$1" 2>&1; fi
+}
+route_dry() { rd "$1" | grep -E "^动作:" | head -1; }
 
 check_route() { # check_route <说法> <期望包含的关键词>
   local got; got="$(route_dry "$1")"
@@ -804,6 +1153,8 @@ check_route() { # check_route <说法> <期望包含的关键词>
   fi
 }
 
+rd_prefetch "帮我把音量调到30" "来一首晴天" "把声音关了" "取消静音" \
+            "桌面有什么" "帮我写一篇年度总结报告"
 check_route "帮我把音量调到30"  "30"
 check_route "来一首晴天"        "晴天"
 check_route "把声音关了"        "静音"
@@ -826,13 +1177,17 @@ else
 fi
 
 # ── 14. D-022 回归：「打开X」必须走应用，不能退化成搜文件 ──────
+mark "10. 回归：历史踩坑防线"
 say "--- 14. D-022 回归 ---"
 
 # 14.1 ⚠⚠ 本次最核心的回归点：
 #   「打开微信」曾被路由到 open_file.sh → 去磁盘搜"微信" → 搜出 40 个文件
 #   → 报 AMBIGUOUS。用户看到的是「有 40 个匹配微信的文件」，完全摸不着头脑。
 #   断言必须验证**动作类型**，不是「能不能打开」——两条路都能"打开"。
-OPEN_WX="$(./route.sh --dry-run "打开微信" 2>&1)"
+rd_prefetch "打开微信" "打开计算器" "启动一下豆包" "帮我打开WPS" "运行浏览器" \
+            "打开备忘录" "打开报告.pdf" "录屏" "停止录屏" \
+            "给张三发微信" "打开文件" "把两张截图拼起来"
+OPEN_WX="$(rd "打开微信")"
 if grep -q "app_open" <<< "$OPEN_WX"; then
   t_ok "「打开微信」路由到应用（app_open），不是文件搜索"
 elif grep -q "open_file.sh" <<< "$OPEN_WX"; then
@@ -844,7 +1199,7 @@ fi
 # 14.2 「打开X」要能在多种口语说法下都命中应用
 OPEN_OK=0
 for s in "打开计算器" "启动一下豆包" "帮我打开WPS" "运行浏览器" "打开备忘录"; do
-  printf '%s' "$(./route.sh --dry-run "$s" 2>&1)" | grep -q "app_open" && OPEN_OK=$((OPEN_OK+1))
+  printf '%s' "$(rd "$s")" | grep -q "app_open" && OPEN_OK=$((OPEN_OK+1))
 done
 if [ "$OPEN_OK" -ge 4 ]; then
   t_ok "「打开X」口语覆盖：5种说法里 $OPEN_OK 种命中应用"
@@ -853,7 +1208,7 @@ else
 fi
 
 # 14.3 带扩展名的必须仍走文件（不能为了修应用把开文件弄坏）
-PDF_OUT="$(./route.sh --dry-run "打开报告.pdf" 2>&1)"
+PDF_OUT="$(rd "打开报告.pdf")"
 if grep -q "open_file.sh" <<< "$PDF_OUT"; then
   t_ok "「打开X.pdf」仍走文件路径（应用优先不能反噬文件）"
 else
@@ -912,8 +1267,8 @@ else
 fi
 
 # 14.8 录屏路由要能开关
-REC_OUT="$(./route.sh --dry-run "录屏" 2>&1)"
-STOP_OUT="$(./route.sh --dry-run "停止录屏" 2>&1)"
+REC_OUT="$(rd "录屏")"
+STOP_OUT="$(rd "停止录屏")"
 if grep -q "screen_rec" <<< "$REC_OUT" \
    && grep -q "screen_rec" <<< "$STOP_OUT"; then
   t_ok "录屏路由：开始/停止都能识别"
@@ -922,8 +1277,8 @@ else
 fi
 
 # 14.9 缺参 preflight：不把缺参变成工具层失败
-PRE1="$(./route.sh --dry-run "给张三发微信" 2>&1)"
-PRE2="$(./route.sh --dry-run "打开文件" 2>&1)"
+PRE1="$(rd "给张三发微信")"
+PRE2="$(rd "打开文件")"
 if grep -q '"error_code":"AMBIGUOUS"' <<< "$PRE1"  \
    && grep -q '"error_code":"AMBIGUOUS"' <<< "$PRE2" ; then
   t_ok "缺参 preflight：发微信/打开文件缺参时给 AMBIGUOUS + hint"
@@ -932,13 +1287,14 @@ else
 fi
 
 # 14.10 路由抢道回归：复合「截图」任务不是截屏
-COMPOSITE="$(./route.sh --dry-run "把两张截图拼起来" 2>&1)"
+COMPOSITE="$(rd "把两张截图拼起来")"
 if grep -q '"chain":"workbuddy"' <<< "$COMPOSITE" ; then
   t_ok "路由抢道回归：「把两张截图拼起来」交给 W6，不误判成截屏"
 else
   t_fail "路由抢道回归：复合截图任务仍被截屏规则吃掉"
 fi
 
+mark "14. D-022 回归（含路由抢道）"
 # ── 15. D-023 回归：面板排版/ 媒体目录 / iKuuuVPN ─────────────────
 say ""
 say "--- 15. D-023 回归（UI 排版 · 媒体目录 · iKuuuVPN）---"
@@ -953,6 +1309,7 @@ else
   t_fail "面板几何自检失败（控件越界/文字溢出/区块高度不吻合）：$(head -3 /tmp/flash_layout.txt | tr '\n' ' ')"
 fi
 
+mark "15.1 面板几何自检（layout-check）"
 # 15.2 自检必须真的有检查能力 —— 注入一个**真实会越界**的故障
 # ⚠ 只断言「退出码为 0」是不够的：万一它只是永远返回 0，等于没检查。
 #
@@ -964,6 +1321,9 @@ fi
 #   真正的超格 = 有个尺寸被改成常数、或加了内容却没让算式知道。
 #   所以这里注入的是**把 window 高度改成手写小常数**（模拟 v2~v4 的
 #   `let H: CGFloat = 328`）—— 内容不变、窗口变小，底部必然被裁掉。
+if [ "$FULL" != "1" ]; then
+  skip_fast "15.2 几何自检反证（要编译一个坏版 flash，~13s）"
+else
 if [ -f "$FLASH_SRC" ]; then
   BADBIN="$(mktemp -t flash_bad_XXXXXX)"
   rm -f "$BADBIN"
@@ -1033,7 +1393,10 @@ PYSPLICE
 else
   t_fail "找不到 flash.swift 源文件，跳过自检有效性反证"
 fi
+fi   # ← P15 快速档跳过块结束（15.2）
 
+
+mark "15.2 几何自检反证（编译坏版）"
 # 15.3 窗口高度必须由算式得出，不能是手写常数
 #  ⚠ 手写 H = 328 就是「超格」的直接成因。加一个常量后必须同步改算式，
 #    这条断言专门挡那种「加了东西但没改 H」。
@@ -1169,6 +1532,7 @@ else
   t_fail "route.sh 有 $((JSON_TOTAL-JSON_FIRST_OK)) 条路由违反「首行恒为 JSON」契约"
 fi
 
+mark "16.1 每条路由的首行必须是合法 JSON"
 # 16.2 「打开应用」这条最常用的路径不能是 0 字节
 #   ⚠ 这是 D-024 的原始现场。单独拎出来断言，因为它是用户最高频的操作。
 OPEN_OUT="$(bash "$DIR/route.sh" "打开微信" 2>/dev/null)"
@@ -1179,6 +1543,7 @@ else
   t_fail "「打开微信」输出 ${OPEN_LEN} 字节 —— 静默失败回归了（D-024）"
 fi
 
+mark "16.2 「打开应用」这条最常用的路径不能是 0 字节"
 # 16.3 复杂任务必须**明确**标为未命中，面板才能识别为「转交」
 #   ⚠ 这里断言的是「区分得开」：未命中路由表 vs 执行失败，
 #     两者都是 ELEMENT_NOT_FOUND，混在一起会让真故障被当成复杂任务而丢失诊断。
@@ -1189,6 +1554,7 @@ else
   t_fail "复杂任务没有明确标记，面板无法区分「听不懂」和「执行失败」"
 fi
 
+mark "16.3 复杂任务必须**明确**标为未命中，面板才能识别为「"
 # 16.4 面板不得把空输出报成「完成」（假成功）
 #   ⚠ 假成功比报错更坏：报错会让人去查，假成功会让人以为系统坏了而放弃。
 #
@@ -1207,6 +1573,7 @@ else
   t_fail "面板缺少「空输出」的显式处理"
 fi
 
+mark "16.4 面板不得把空输出报成「完成」"
 # 16.4b 空闲不抢鼠标：失焦必须停动画/自检，且不再设置光标
 #   只降 layer 不够；globeTimer 0.06s 一直重绘 + NSCursor 会让人感觉鼠标被抢。
 if grep -q 'func windowDidResignKey' <<< "$FLASH_CODE"  \
@@ -1217,6 +1584,7 @@ else
   t_fail "面板空闲仍可能抢鼠标（失焦未停动画，或仍有 NSCursor）"
 fi
 
+mark "16.4b 空闲不抢鼠标"
 # 16.4c 面板自检不得调用会移动鼠标的 doctor
 #   doctor 会移动光标 3 次做输入探测；自检必须是只读的。
 if ! grep -q 'probe(\["doctor"' "$DIR/flash_archive.swift" \
@@ -1226,6 +1594,7 @@ else
   t_fail "面板自检仍调用 doctor，可能移动鼠标"
 fi
 
+mark "16.4c 面板自检不得调用会移动鼠标的 doctor"
 # 16.5 route.sh 不得有「判断完就 exit」导致输出被吞的写法
 #   ⚠ 这是 D-024 的**结构性**根因：把命令输出丢进管道做判断，
 #     却只保留判断结果、丢掉输出本身。这类写法在别的脚本里也可能出现。
@@ -1264,6 +1633,7 @@ else
   t_ok "route.sh 没有「判断与回显混用」的吞输出写法"
 fi
 
+mark "15.3~16 D-023 余下 + route 契约"
 # ── 17. 开场动画（bootanim）回归 ───────────────────────────────────
 # 这一组锚的全是**"看起来没 bug、实际功能整个不工作"**的坑。
 # 它们的共同特征：没有报错、没有异常、日志干干净净 —— 只是东西不出现。
@@ -1554,7 +1924,10 @@ fi
 #   ⚠ WB_LAUNCH_MUTE=1 必须带：否则自检要放 2.5 秒开场音效。
 #   ⚠ 全屏 → window WxH == screen WxH；92%×86% 旧版 → 必然不等（差 8%/14%）。
 #   ⚠ 多屏机器上取主屏 —— 与产品行为一致（动画只盖主屏），不是测试放水。
-if [ -x "$BOOT_LAUNCH" ] && grep -q 'WB_LAUNCH_MUTE' "$BOOT_LAUNCH_SW"; then
+#   ⚠ P15：这一条**真播 2.5 秒全屏动画**，归"视觉/动画项"→ 快速档跳过（显式打印）。
+if [ "$FULL" != "1" ]; then
+  skip_fast "17.20 全屏窗口尺寸实测（要真播 2.5s 开场动画）"
+elif [ -x "$BOOT_LAUNCH" ] && grep -q 'WB_LAUNCH_MUTE' "$BOOT_LAUNCH_SW"; then
   WB_ERR="$(mktemp /tmp/macctl_wbl.XXXXXX)"
   WB_LAUNCH_MUTE=1 WB_LAUNCH_DEBUG=1 "$BOOT_LAUNCH" play --no-launch --force 2>"$WB_ERR" &
   WB_PID=$!
@@ -1607,6 +1980,7 @@ else
   t_fail "自检采集在主线程 —— 会在每次重绘时 fork 进程，面板会卡死"
 fi
 
+mark "14. D-022 回归"
 # ══ 18. 浏览器默认值 + 零系统弹窗（2026-10-22 用户反馈）════════════
 #
 # 背景：用户要求「打开浏览器默认打开谷歌浏览器」，
@@ -1716,6 +2090,9 @@ fi
 #   判据：数 CoreServicesUIAgent 的窗口数（系统弹窗就是它画的）。
 #   ⚠ 计数用**一次性编译**的探针，不要用 `swift -e` ——
 #   每次 `swift -e` 都要重编译（十几秒），自检会慢到没人愿意跑。
+if [ "$FULL" != "1" ]; then
+  skip_fast "18.9 真启动 Safari 验零系统弹窗（会真的把 Safari 拉到前台）"
+else
 CSUI_PROBE="/tmp/macctl_csui_probe"
 if [ ! -x "$CSUI_PROBE" ] || [ "$MACCTL_SRC" -nt "$CSUI_PROBE" ]; then
   cat > /tmp/_csui_probe.swift <<'SWEOF'
@@ -1742,6 +2119,8 @@ if [ "${AFTER}" -le "${BEFORE}" ]; then
 else
   t_fail "启动 Safari 弹出了系统框（CoreServicesUIAgent 窗口 ${BEFORE}→${AFTER}）"
 fi
+fi   # ← P15 快速档跳过块结束（18.9）
+
 
 # 18.10 快捷打开必须把 App 送到**最上层**（2026-10-22 用户要求）
 #   用户原话：「闪控快捷打开 app 这个功能，无论 app 是否开启，
@@ -1785,6 +2164,9 @@ else
   t_fail "面板层级只有单向 —— 降层后回不到置顶，用户会找不到面板"
 fi
 
+if [ "$FULL" != "1" ]; then
+  skip_fast "18.11 热启动置前连跑 5 次（每次都真启动计算器抢前台）"
+else
 RAISE_OK=0; RAISE_N=0; RAISE_T1=0; RAISE_LOG=""
 for _i in 1 2 3 4 5; do
   RAISE_N=$((RAISE_N + 1))
@@ -1804,7 +2186,10 @@ if [ "$RAISE_OK" -eq "$RAISE_N" ]; then
 else
   t_fail "热启动置前 ${RAISE_OK}/${RAISE_N} 次成功 —— Q4 会复现（详情：${RAISE_LOG}）"
 fi
+fi   # ← P15 快速档跳过块结束（18.11）
 
+
+mark "18. 浏览器默认值 + 零系统弹窗（2026-10-22 用户反馈）"
 # ══ 18.12~18.14 工件B：转交全自动（2026-10-22 夜）══════════════
 #
 # 目标：闪控输入一句复杂指令 → WorkBuddy **自动**新建任务、自动粘贴、
@@ -1847,6 +2232,7 @@ else
   t_fail "技能失败会阻断转交 —— 一次 UI 改动就能让整个转交失效"
 fi
 
+mark "18.12~18.14 工件B：转交全自动（2026-10-22 夜）"
 # ══ 19. 三维地球几何（2026-10-22 用户要求：logo 换成动态三维旋转地球）═════
 #
 # 背景：用户要求把右上角「+号旁转圈的 logo」换成动态三维旋转地球。
@@ -1954,6 +2340,7 @@ else
   t_fail "flash 二进制缺失 —— 像素级回归无从谈起"
 fi
 
+mark "19.1~19.8 地球几何（源码/探针断言）"
 # 19.9 像素级回归：球心附近**不得**出现横贯球的水平亮线
 #   ⚠ 这是三个渲染 bug 的**最终判据** —— 静态断言防不住「公式对但画错」，
 #     只有真的出一张图、数像素，才能证明用户看到的是椭圆不是直线。
@@ -1969,6 +2356,9 @@ fi
 #     globeSize），earthRadius = min(w,h)/2 - 11 = 84pt = 168px。
 #     所以 R = min(W,H)/2 - 22（2x 下 11pt = 22px）。
 GLOBE_SHOT="/tmp/macctl_globe_selftest.png"
+if [ "$FULL" != "1" ]; then
+  skip_fast "19.9 地球像素回归（出图 + 逐像素数横贯亮线）"
+else
 if "$DIR/flash" --snapshot "$GLOBE_SHOT" --globe-only --zoom 4 --phase 0 >/dev/null 2>&1 \
    && [ -f "$GLOBE_SHOT" ]; then
   LONGEST="$(/usr/bin/python3 - "$GLOBE_SHOT" <<'PYEOF' 2>/dev/null
@@ -2002,13 +2392,19 @@ PYEOF
 else
   t_fail "地球快照出图失败 —— 无法做像素级回归"
 fi
+fi   # ← P15 快速档跳过块结束（19.9）
 
+
+mark "19.9 地球像素回归（出图+数像素）"
 # 19.10 反向验证：这套像素判据**抓得到** bug 版
 #   ⚠ 只会说「现在是对的」的测试是半残的 —— 它没证明过自己能发现错误。
 #   做法：把第一版的两个 bug 原样注回去（背面 x 取反 + 换边时对已有
 #   内容的路径用 line 硬连），编译出一个「故意坏掉的二进制」，
 #   跑同一条像素判据，必须判失败。
 #   通过后才承认：19.9 的 ✓ 是真的 ✓，不是永远 ✓。
+if [ "$FULL" != "1" ]; then
+  skip_fast "19.10 像素判据反向验证（编译坏版 flash + 4 个相位出图，~22s）"
+else
 BAD_SHOT="/tmp/macctl_globe_selftest_bad.png"
 BAD_SW="/tmp/_flash_globe_bad.swift"
 BAD_BIN="/tmp/_flash_globe_bad"
@@ -2108,7 +2504,10 @@ PYEOF
     t_fail "bug 版源码生成失败 —— 反向验证没跑成"
   fi
 fi
+fi   # ← P15 快速档跳过块结束（19.10）
 
+
+mark "19. 三维地球几何（2026-10-22 用户要求：logo 换成动态三维旋转地球）"
 # ══ 19.11~19.12 工件C：大陆轮廓（2026-10-22 夜）══════════════════
 #
 # 用户要求「一眼认出五大洲轮廓」。只有经纬网的球是地球仪不是地球，
@@ -2144,6 +2543,9 @@ fi
 #     低于 20% = 大陆没画出来 / 数据为空；高于 50% = 线挤成一团糊版。
 #   ⚠ 三个相位都取：先转 28° 时亚欧在正面，转 220° 时美洲在正面 ——
 #     只测一个相位，万一某个半球的数据坏了（比如跨日界线的边画飞了）发现不了。
+if [ "$FULL" != "1" ]; then
+  skip_fast "19.12 大陆轮廓覆盖率（三个相位各出一次图）"
+else
 GLOBE_COVER=""
 GLOBE_COVER_OK=1
 for _ph in 28 130 220; do
@@ -2191,7 +2593,10 @@ if [ "$GLOBE_COVER_OK" -eq 1 ]; then
 else
   t_fail "球内亮墨占比越界：${GLOBE_COVER} —— <1% 大陆/光点没画出来，>30% 糊成一团"
 fi
+fi   # ← P15 快速档跳过块结束（19.12）
 
+
+mark "19.11~19.12 工件C：大陆轮廓（2026-10-22 夜）"
 # ══ 20. 开场动画交互模型（2026-10-22 用户拍板）═════════════════════════
 # 用户原话：「得我点击了空格或者enter才进入下一个动画的界面，不是自己立刻动
 # （但是如果3秒内没有人交互，自动进入下一个动画的界面）」+「动画必须先于
@@ -2363,6 +2768,7 @@ else
   t_fail "没有 install-boot —— 开机动画没法可靠注册（踩过的坑会复发）"
 fi
 
+mark "20.1~20.11 动画源码断言"
 # 20.12 真副作用·闸门拦得住：门限 8 秒的动画在第 6 秒时应仍停在第一幕
 #   （暗屏）+ 闸门提示可见。判据是**实测校准**过的：
 #   ⚠ 采样点不能贴着门限（2026-10-22 自检踩过）：原采样就在第 8 秒、门限也是
@@ -2381,6 +2787,10 @@ fi
 #        WorkBuddy（浅色+橙品牌色，均值 640），会被误读成"场景自己走了"
 #     ② 采样步长 2 且查整条提示带 —— 流空线只有 2px 高，y 步长 4 有
 #        50% 概率整条漏掉（第一版就误报过 orange=0）
+# ⚠ P15 快速档跳过：这一条要**整屏截图**，而且最多 3 轮 ×6s 真播全屏动画。
+if [ "$FULL" != "1" ]; then
+  skip_fast "20.12 场景闸门拦得住（整屏截图，最多 3 轮×6s 播放）"
+else
 GATE_SHOT="/tmp/macctl_gate_selftest.png"
 GATE_ERR="$(mktemp /tmp/macctl_gate.XXXXXX)"
 # ⚠ 这条判据量的是**屏幕**，不是页面内部状态：只要那一刻桌面上盖了别的东西
@@ -2449,12 +2859,18 @@ elif [ "$GATE_PASS" -eq 1 ]; then
 else
   t_fail "闸门没拦住（3 轮都没拍到暗幕）：第 6 秒均值=${GATE_MEAN:-未取到}（应 <20）提示带=${GATE_BAND:-0}px；现场保留在 /tmp/macctl_gate_FAIL_hold.png，debug：${GATE_LINE:-无}"
 fi
+fi   # ← P15 快速档跳过块结束
 
+mark "20.12 闸门拦得住（播放+截图）"
 # 20.13 真副作用·闸门放得开：默认 3 秒超时的动画在 15 秒时应已进入第二幕
 #   （洗白后的暖白档案板，均值 25+）。与 20.12 合起来证明：
 #   拦得住（不是定时器）也放得开（不是死等按键）。
 #   ⚠ 同样带 visible=true 护栏：窗口没起时截图会拍到背后的 WorkBuddy
 #     （也是亮的）—— 没有护栏会"假通过"，比失败更糟。
+# ⚠ P15 快速档跳过：固定 sleep 15 + 整屏截图，是全套里最贵的一条。
+if [ "$FULL" != "1" ]; then
+  skip_fast "20.13 闸门放得开（sleep 15 + 整屏截图）"
+else
 GATE_SHOT="/tmp/macctl_gate_selftest.png"
 GATE_ERR="$(mktemp /tmp/macctl_gate.XXXXXX)"
 # 同 20.12：跑前清场，防别人的 splash 窗口污染均值
@@ -2505,7 +2921,9 @@ PYEOF
 else
   t_fail "默认闸门实测截图失败 —— 无法验证'放得开'"
 fi
+fi   # ← P15 快速档跳过块结束
 
+mark "20.13 闸门放得开（sleep 15 + 截图）"
 # 20.14 五角星几何：计算式顶点（STAR IIFE）+ R=25.5 + 第一幕必须用 svgStar
 #   （2026-10-22 用户要求 logo 换五角星；R 的演进：20 太小 → 23.2（金色
 #     折面版）→ 25.5（用户要求"比例大一点"）：星径占画布 85%，与旋转环
@@ -2557,6 +2975,7 @@ else
   t_fail "CSS 缺失（orbit keyframes/fill-box/200px/star-bank 之一不在）—— 环会绕左上角公转或星不倾斜"
 fi
 
+mark "20.14~20.16 五角星/环源码断言"
 # 20.17 真副作用·星大且在转 + 键盘焦点真的在窗上：一轮播放拿两帧（间隔 1.8s）
 #   ⓪ 键盘判据 = wblaunch 自己报的三个开关：WB_LAUNCH_DEBUG=1 时它在窗口
 #     makeKey 后 0.6s 打一行 key=/firstResp=/active=。这一项是**用户反馈的
@@ -2611,6 +3030,12 @@ fi
 #      削尾 ~20px → 预期 300~320 × 285~300，合格区间 275~350
 #   ⚠ 同一轮播放的两帧截图同时供 ①旋转 与 ②尺寸 用（一轮 25 秒已经够久）。
 #     唯独「尺寸」那条在量歪时会**重放一轮再量**（P11），理由见 star_round()。
+# ⚠ P15 快速档跳过：star_round() 每轮要**真播一轮开场动画**（0.8s 起播 +
+#   3.0s 抓 A 帧 + 1.8s 抓 B 帧），量歪还会重试，最坏 3 轮 ≈75s。
+#   全量档（--full）照跑，断言一条没删。
+if [ "$FULL" != "1" ]; then
+  skip_fast "20.17 五角星尺寸 + 旋转环帧差（真播一轮动画，含最多 3 次重试）"
+else
 STAR_SHOT_A="/tmp/macctl_star_a.png"
 STAR_SHOT_B="/tmp/macctl_star_b.png"
 STAR_DEBUG="/tmp/macctl_star_debug.log"
@@ -2780,7 +3205,9 @@ fi
 if [ "${STAR_BAND_PASS:-0}" = "1" ] && star_box_ok "${STAR_W:-0}" "${STAR_H:-0}"; then
   rm -f "$STAR_SHOT_A" "$STAR_SHOT_B" "$STAR_DEBUG"
 fi
+fi   # ← P15 快速档跳过块结束
 
+mark "20.17 五角星视觉两帧（star_round，含重试）"
 # ══ 21. 工件B 端到端（放最后：会真的操作 WorkBuddy 窗口）═══════════
 # 21.1 真跑：面板真实路径（建面板 → show 拿激活权 → 降层 → 转交 → 发送）
 # ⚠ 载荷必须自带「别再转交」：这条自检的正文和用户的真实指令长得一模一样，
@@ -2794,6 +3221,7 @@ case "$HD_OUT" in
 esac
 
 
+mark "21. 工件B 端到端（转交真跑）"
 # ══ 22. 「用不了」的三条真根因 + 交付件（2026-10-22 深夜）════════════
 #
 # 用户原话：「我现在无法使用快捷键启动闪控」。查下来是三件事叠在一起：
@@ -2869,6 +3297,7 @@ else
   t_fail "缺 .app 外壳 —— 用户只能靠命令行启动，登录项也选不到它"
 fi
 
+mark "22. 「用不了」的三条真根因 + 交付件（2026-10-22 深夜）"
 # ══ 23. 别再弹授权框（2026-10-23 用户投诉）════════════════════════════
 #
 # 用户原话：「闪控每次启动都会询问我是否允许查看桌面，我明明已经授权了」。
@@ -2944,12 +3373,14 @@ else
   t_fail "plist 没配 KeepAlive —— 闪控被杀掉后热键会一直失效"
 fi
 
+mark "23. 别再弹授权框（2026-10-23 用户投诉）"
 # ══ 24. 队列隔离回归（P14 · 2026-10-25）═════════════════════════
 # 用户原话：「菜单栏图标从 ⚡️ 变成 ⚠️1，我以为程序坏了」。
 # 假待确认项一旦落进生产队列，用户点「确认」就真把消息发出去 ——
 # 这不是显示问题，是**能造成真实外部副作用**的问题。
 # 所以隔离本身也要有断言：光改了代码、下次谁又写死一次生产路径，
 # 也必须被这一节抓住。
+mark "24. 队列隔离回归（P14 · 2026-10-25）"
 say "--- 24. 队列隔离回归 ---"
 
 # 24.1 自检期间队列必须指向临时目录
@@ -2981,10 +3412,119 @@ else
   t_fail "生产队列混进自检假数据：${PROD_TESTHITS}（用户点「确认」会真的发出去）"
 fi
 
+mark "24. 队列隔离回归（P14 · 2026-10-25）"
+# ══ 25. 防套娃 + 并发锁（P15b · 2026-10-25 打回）════════════════════════
+#
+# 用户打回原话：「自检会自我递归（自检里起自检，越套越深，30 分钟不结束）」，
+# 并给出三条硬要求：① 锁识别祖先进程 ② 验收测试不许真起第二份自检
+# ③ 加防套娃回归断言（快速档也要跑）。
+#
+# 设计取舍（改了就是退步，写在这里防止下次"优化"回去）：
+#   • 三条断言全部只用**纯函数 + 独立临时目录**验证，不 fork 整份脚本：
+#     `_lock_verdict` 判 ANCESTOR/ALIVE/DEAD、`_depth_next` 算断路器放行与否、
+#     `mkdir` 原子性用 /tmp 下自己造的目录验 —— 全部零成本、零副作用。
+#   • 唯一一处真起进程（25.9）是**验证断路器本身**：子层带 SELFTEST_DEPTH=1
+#     与 --no-lock-test 启动，必须在 depth 判据处（抢锁之前）就退出。
+#     这是有意的：只测纯函数无法证明"真的再起一份也进不来"。
+#   • 25.1 的实例数采样来自 mark() 全程采样（约 7 个点），不是"收尾时看一眼"。
+#
+# ⚠ 本节的断言**不许**为了省时间挪进全量档：递归炸弹的成本是 30 分钟，
+#   这几条加起来 < 0.3s，性价比最高的一条防线。
+say "--- 25. 防套娃 + 并发锁 ---"
+
+if [ "$LOCK_TEST" = "1" ]; then
+  # 25.1 运行期实例数恒为 1（递归炸弹的直接回归断言）
+  _nest_probe
+  if [ "$NEST_MAX" -eq 1 ]; then
+    t_ok "防套娃：${NEST_SAMPLES} 个采样点自检实例数恒为 1（没出现「自检起自检」；同期 pgrep -f 峰值 ${NEST_PGREP_MAX} 是 fork 出的子壳，同 argv 不算）"
+  else
+    t_fail "防套娃：最多同时 ${NEST_MAX} 份自检在跑（采样 ${NEST_SAMPLES} 次）${NEST_LOG}"
+  fi
+
+  # 25.2/25.3 祖先识别：自己和自己的父进程都必须判成 ANCESTOR
+  check "锁裁决：持锁人是我自己 → ANCESTOR（判成嵌套，不是并发）" \
+        "ANCESTOR" "$(_lock_verdict $$)"
+  check "锁裁决：持锁人是我父进程 → ANCESTOR（子自检必须立刻退）" \
+        "ANCESTOR" "$(_lock_verdict "$PPID")"
+
+  # 25.4/25.5 无关进程：活着 → ALIVE（正常并发要拒），死了 → DEAD（僵尸锁要能接管）
+  sleep 5 & SLEEP_PID=$!
+  check "锁裁决：无关的存活进程 → ALIVE（正常的第二份被拒）" \
+        "ALIVE" "$(_lock_verdict "$SLEEP_PID")"
+  # 25.4b/25.4c 持锁人身份校验：pid 活着 ≠ 还是自检（僵尸 / pid 复用都要能接管）
+  check "持锁人身份：我自己 → 认得出是自检进程" \
+        "YES" "$(_looks_like_selftest $$ && echo YES || echo NO)"
+  check "持锁人身份：sleep（活着但不是自检）→ 认不出（按僵尸锁接管，不会永久哑火）" \
+        "NO" "$(_looks_like_selftest "$SLEEP_PID" && echo YES || echo NO)"
+  kill "$SLEEP_PID" 2>/dev/null
+  wait "$SLEEP_PID" 2>/dev/null
+  ( exit 0 ) & GONE_PID=$!
+  wait "$GONE_PID" 2>/dev/null
+  check "锁裁决：已退出的进程 → DEAD（kill -9 后锁能被接管，不会永久哑火）" \
+        "DEAD" "$(_lock_verdict "$GONE_PID")"
+
+  # 25.6 mkdir 原子性：同一目录第二次 mkdir 必失败（锁的互斥底座）
+  LOCKUNIT="$(mktemp -d /tmp/lt-lockunit.XXXXXX)"
+  mkdir "$LOCKUNIT/l" 2>/dev/null
+  mkdir "$LOCKUNIT/l" 2>/dev/null; LOCKUNIT_RC=$?
+  if [ "$LOCKUNIT_RC" -ne 0 ]; then
+    t_ok "锁原子性：同一时刻第二次 mkdir 失败（rc=${LOCKUNIT_RC}），互斥成立"
+  else
+    t_fail "锁原子性失效：第二次 mkdir 也成功了 —— 锁不住任何东西"
+  fi
+  rm -rf "$LOCKUNIT"
+
+  # 25.7/25.8 断路器算术：顶层放行、子层必拒
+  check "断路器：顶层（depth 0→1）放行" \
+        "ALLOW" "$(_depth_next 0 >/dev/null 2>&1 && echo ALLOW || echo DENY)"
+  check "断路器：子层（depth 1→2）立即拒绝" \
+        "DENY" "$(_depth_next 1 >/dev/null 2>&1 && echo ALLOW || echo DENY)"
+
+  # 25.9 真起一层子自检：必须"立刻退"（不是跑完再退），且不许碰锁
+  CHILD_T0="$(_now_ms)"
+  CHILD_OUT="$(SELFTEST_DEPTH=1 "${BASH:-/bin/bash}" ./selftest.sh --no-lock-test --keep-muted 2>&1 | head -2)"
+  CHILD_MS=$(( $(_now_ms) - CHILD_T0 ))
+  if printf '%s' "$CHILD_OUT" | grep -q "嵌套过深"; then
+    t_ok "断路器实证：子层一进来就被拒（${CHILD_MS}ms，未执行任何断言）"
+  else
+    t_fail "断路器实证失败：子层没有立刻退出（${CHILD_MS}ms，输出=${CHILD_OUT:-空}）—— 这就是递归炸弹"
+  fi
+  # 25.10 子层不许夺锁（它连抢锁那步都不该走到）
+  LOCK_PID_AFTER="$(cat "$SELFTEST_LOCK/pid" 2>/dev/null || true)"
+  check "子层没有动过锁（持锁人仍是 $$）" "$$" "${LOCK_PID_AFTER:-空}"
+  # 25.11 子层收尸后实例数回到 1
+  check "子层退出后自检实例数回到 1（收尸干净，不留僵尸）" "1" "$(_inst_count)"
+else
+  say "  ⊘ 跳过（--no-lock-test）：25.x 锁/防套娃单测"
+fi
+
+# ── 项数守恒（P15b）────────────────────────────────────────────────
+# 目的：抓"为了跑快偷偷删断言/静默跳过"。项数是**写死的基线**，加了断言就同步 +1
+#   （这是特意的摩擦：项数变化必须是显式决定）。
+# ⚠ 两档基线不同，且**不是笔误**：全量档比快速档多 2 项 —— 有的 `skip_fast` 背后
+#   是**两条**断言（例如"五角星尺寸 + 旋转环帧差"快速档算 1 次跳过，全量档算 2 项）。
+#   所以快速档基线 208（= 198 跑 + 10 跳过），全量档基线 210（= 208 + 2）。
+# ⚠ 本断言自己也算一项，所以比较时用 (基线 - 1)，否则永远差 1。
+if [ "$FULL" = "1" ]; then FULL_TOTAL=210; else FULL_TOTAL=208; fi
+if [ "$FULL" = "1" ]; then _TIER_NAME="全量档"; else _TIER_NAME="快速档"; fi
+_ACCT=$(( PASS + FAIL + SKIPPED + 1 ))
+if [ "$_ACCT" -eq "$FULL_TOTAL" ]; then
+  t_ok "项数守恒：${_TIER_NAME:-本档}基线 ${FULL_TOTAL} 项 = 实跑 $((_ACCT - 1)) 项 + 本断言（无静默删除、无静默跳过）"
+else
+  t_fail "项数守恒破了：本档基线 ${FULL_TOTAL} 项，实跑 $((_ACCT - 1)) 项 + 本断言 1 项 = ${_ACCT} 项（差分说明有断言被删/被静默跳过）"
+fi
+
 # ── 总结 ────────────────────────────────────────────────────────
+# ⚠ 计时必须在「结果」**之前**打印：慢的东西一屏到底才看得到，
+#   跑到最后才发现"这次花了 80 秒"已经晚了。trap 里还有一次兜底
+#   （Ctrl-C / 提前 exit 也能看到），靠 TIMING_PRINTED 防重复。
+_print_timing
 say ""
 say "=== 结果 ==="
-say "通过 $PASS 项，失败 $FAIL 项"
+# ⚠ 统计行格式是用户点名的（P15b）：通过 / 失败 / 跳过 三个数都要在，
+#   且要带档位后缀 —— 只报"通过 189"看不出少了什么。
+if [ "$FULL" = "1" ]; then _TIER="全量档"; else _TIER="快速档"; fi
+say "通过 $PASS 项，失败 $FAIL 项，跳过 $SKIPPED 项（${_TIER}）"
 if [ "$FAIL" -eq 0 ]; then
   say "✅ 全部通过"
   exit 0

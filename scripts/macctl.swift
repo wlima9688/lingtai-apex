@@ -516,7 +516,7 @@ func captureAppWindow(_ bid: String) -> (CGImage, CGRect)? {
                       CGRect(origin: f.origin, size: f.size))
         } catch { }
     }
-    sem.wait()
+    _ = sem.wait(timeout: .now() + 12) == .timedOut ? FileHandle.standardError.write("⚠ 截图超时 12s（SCK 卡死；`pkill -x macctl` 可恢复）\n".data(using: .utf8)!) : ()
     return result
 }
 func captureDisplay(exceptWindowID: UInt32? = nil) -> (CGImage, CGRect)? {
@@ -542,7 +542,19 @@ func captureDisplay(exceptWindowID: UInt32? = nil) -> (CGImage, CGRect)? {
             result = (img, display.frame)
         } catch { }
     }
-    sem.wait()
+    // ⚠⚠ 必须有超时，不能裸 `sem.wait()`（P13 实测踩到，写了 40 分钟才认出来）：
+    //   SCK 的 `captureImage` 会**静默无限期阻塞**——不抛错、不返回、没有日志。
+    //   触发过一次的具体模样：一个挂住的 `macctl locate` 进程留在后台，之后
+    //   **同一路径**的 captureImage 全部无限阻塞（把同一个二进制换个文件名跑就正常，
+    //   所以一开始误判成"权限/TCC 问题"）。连坐的是 shot / pixel / scan / locate / OCR
+    //   全部卡死，脚本像死了一样没有输出，自检直接挂在那里。
+    //   "无限等待"违反第一条铁律（工具层失败必须显式报错）——所以这里封顶 12 秒：
+    //   超时就当"拍不到"返回 nil，让上层走它已有的降级/报错路径，而不是一起卡死。
+    if sem.wait(timeout: .now() + 12) == .timedOut {
+        FileHandle.standardError.write(
+            "⚠ 截图超时 12s（SCK 卡死；多半有挂住的 macctl 进程占着屏幕捕获，`pkill -x macctl` 后可恢复）\n"
+                .data(using: .utf8)!)
+    }
     return result
 }
 
@@ -1685,7 +1697,7 @@ func cmdShot() {
                 }
             } catch { out("ERR: \(error.localizedDescription)") }
         }
-        sem.wait()
+        _ = sem.wait(timeout: .now() + 12) == .timedOut ? FileHandle.standardError.write("⚠ 截图超时 12s（SCK 卡死；`pkill -x macctl` 可恢复）\n".data(using: .utf8)!) : ()
         return
     }
 
@@ -3029,7 +3041,7 @@ func cmdScan() {
                 }
             } catch { out("ERR: \(error.localizedDescription)") }
         }
-        sem.wait()
+        _ = sem.wait(timeout: .now() + 12) == .timedOut ? FileHandle.standardError.write("⚠ 截图超时 12s（SCK 卡死；`pkill -x macctl` 可恢复）\n".data(using: .utf8)!) : ()
         return
     }
     guard let (img, frame) = captureDisplay() else { die("截图失败") }
@@ -3554,7 +3566,7 @@ func cmdTapText() {
             }
         } catch { }
     }
-    sem.wait()
+    _ = sem.wait(timeout: .now() + 12) == .timedOut ? FileHandle.standardError.write("⚠ 截图超时 12s（SCK 卡死；`pkill -x macctl` 可恢复）\n".data(using: .utf8)!) : ()
     guard let base = img else { die("截图失败") }
 
     // 限定区域
