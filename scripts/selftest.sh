@@ -3213,12 +3213,28 @@ mark "20.17 五角星视觉两帧（star_round，含重试）"
 # ⚠ 载荷必须自带「别再转交」：这条自检的正文和用户的真实指令长得一模一样，
 #   接收端会照着再跑一次自检 → 再转交 → 无限套娃（每次约 4 秒、多一个会话）。
 #   所以尾巴上写死回执要求，让接收端停在「回一声」而不是继续跑。
-HD_TXT="闪控自检 · 转交链路 $(date +%H%M%S)｜回执 OK 即可，勿再转交"
+# ⚠⚠ 2026-10-25 用户拍板 A+C：这条测试**默认不跑**，且**默认不发送**。
+#   事故：它以前真派活 → 一天在 WorkBuddy 里造出 123 个「闪控自检·转交链路」会话，
+#   用户看到"一直在刷这个检测"。测试不许有真实外部副作用。
+#   · 日常（快速档）：显式打印跳过，连窗口都不碰
+#   · 全量档 + SELFTEST_ALLOW_HANDOFF=1：才真跑，且默认仍**不按回车**
+#     （加 --submit 才真发，自检永不使用该开关）
+if [ "$FULL" != "1" ]; then
+  echo "  ⊘ 跳过（快速档）：工件B 端到端转交（会操作 WorkBuddy 窗口）"
+  SKIPPED=$((SKIPPED + 1))
+elif [ "${SELFTEST_ALLOW_HANDOFF:-0}" != "1" ]; then
+  echo "  ⊘ 跳过（未设 SELFTEST_ALLOW_HANDOFF=1）：工件B 端到端转交"
+  SKIPPED=$((SKIPPED + 1))
+else
+HD_TXT="闪控自检 · 转交链路 $(date +%H%M%S)｜仅验证链路，勿回执、勿再转交"
 HD_OUT="$("$DIR/flash" --selftest-handoff "$HD_TXT" 2>/dev/null | tail -1)"
+# 不管成败都把输入框清干净：dry 模式只粘贴不发送，残留会被下一条测试带进正文
+"$DIR/macctl" clear --app com.tencent.workbuddy.mac >/dev/null 2>&1 || true
 case "$HD_OUT" in
   *"已转交"*|*'"ok":true'*) t_ok "转交端到端成功（新建任务→粘贴→选技能→发送，零人工）：$HD_OUT" ;;
   *) t_fail "转交端到端失败：$HD_OUT —— WorkBuddy 界面结构变了？辅助功能授权掉了？" ;;
 esac
+fi   # ← 第 21 节开关结束（A+C）
 
 
 mark "21. 工件B 端到端（转交真跑）"

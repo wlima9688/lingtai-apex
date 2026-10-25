@@ -2264,11 +2264,14 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
     /// - Parameter skill: 默认挂 mac-control；自检传 nil ——
     ///   ⚠ 挂了技能，被转交过去的那一端会真的开始操作桌面（实测它打开「下载」、
     ///   列目录、弹确认框），反过来干扰自检里所有计时敏感的像素判据。
-    func performHandoff(_ text: String, skill: String? = "mac-control") {
+    /// submit=false 时**只走到"粘贴完成"就停**，不按回车、不发送。
+    /// 为什么要有（2026-10-25 用户拍板 A+C）：自检曾经真派活，一天在 WorkBuddy 里
+    /// 造出 123 个「闪控自检·转交链路」会话 —— 测试**不许有真实外部副作用**。
+    func performHandoff(_ text: String, skill: String? = "mac-control", submit: Bool = true) {
         statusLabel.textColor = Palette.dim
         statusLabel.stringValue = "转交中 · 新建任务 → 粘贴 → 发送…"
         lowerPanelForApp()
-        var r = handoffToWorkBuddy(text, skill: skill)
+        var r = handoffToWorkBuddy(text, skill: skill, submit: submit)
         // ⚠ 转交是真按键 + 真 AX 点击，天然有抖动（实测 10 次里偶发 1 次卡在某步）。
         //   失败一次就放弃太脆 —— 立刻重试一遍（会重新新建任务/清空输入框），
         //   成功率从 ~90% 提到接近 100%。
@@ -3232,7 +3235,10 @@ func runMain() {
         panel.buildIfNeeded()
         panel.show()
         RunLoop.current.run(until: Date().addingTimeInterval(0.4))
-        panel.performHandoff(text, skill: nil)   // 自检不挂技能（见 performHandoff 注释）
+        // ⚠ 默认**不发送**：真发会在 WorkBuddy 里建会话（2026-10-25 一天 123 个）。
+        //   要真发必须显式加 --submit（自检只在 SELFTEST_ALLOW_HANDOFF=1 时才这么做）。
+        let selSubmit = argv.contains("--submit")
+        panel.performHandoff(text, skill: nil, submit: selSubmit)
         print(panel.statusLabel.stringValue)
         exit(0)
     }
