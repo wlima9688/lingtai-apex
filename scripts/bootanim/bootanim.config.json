@@ -3,7 +3,7 @@
   "gateTimeoutMs": 5333,
   "identity": "温昼",
   "identityId": "LS-WZ-0961-01",
-  "sceneGate": false,
+  "sceneGate": true,
   "speed": 1,
   "theme": "dark"
 }

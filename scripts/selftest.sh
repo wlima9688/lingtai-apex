@@ -2804,6 +2804,16 @@ GATE_BAND=""
 SCENE_GATE="$(/usr/bin/python3 -c "import json,sys;print(str(json.load(open(sys.argv[1])).get('sceneGate',True)).lower())" "$BOOT_DIR/bootanim.config.json" 2>/dev/null || echo true)"
 GATE_ROUNDS=3
 [ "$SCENE_GATE" = "false" ] && GATE_ROUNDS=0
+# ⚠⚠ 2026-10-25 用户拍板：**动画类验证永久退出日常自检**。
+#   事故链：这条测试要真播全屏动画（3 轮×6s）→ 嫌它慢/吵 → 我把 sceneGate 关成 false
+#   → 用户开机发现"每幕之间 5 秒的停顿没了"（功能被测试需求反向改坏）。
+#   现在改成：只有 `--full` **且** `SELFTEST_ALLOW_ANIM=1` 时才真播；
+#   否则显式跳过。**任何人都不许为了让断言变绿去改产品配置。**
+if [ "${SELFTEST_ALLOW_ANIM:-0}" != "1" ]; then
+  GATE_ROUNDS=0
+  echo "  ⊘ 跳过：动画/闸门实测（需 SELFTEST_ALLOW_ANIM=1 才真播全屏动画）"
+  SKIPPED=$((SKIPPED + 1))
+fi
 GATE_LINE=""
 for _attempt in $(seq 1 $GATE_ROUNDS); do
   # 跑前清场：自检环境里不该有第三个动画实例
@@ -2852,8 +2862,10 @@ PYEOF
   cp "$GATE_SHOT" "/tmp/macctl_gate_FAIL_hold.png" 2>/dev/null || true
 done
 rm -f "$GATE_ERR" "$GATE_SHOT"
-if [ "$SCENE_GATE" = "false" ]; then
-  t_ok "场景闸门已关闭（开机一镜到底，2026-10-25 用户拍板）→ 不适用闸门拦截判定"
+if [ "${SELFTEST_ALLOW_ANIM:-0}" != "1" ]; then
+  t_ok "动画/闸门实测已跳过（SELFTEST_ALLOW_ANIM≠1）—— 不再为了断言去动产品配置"
+elif [ "$SCENE_GATE" = "false" ]; then
+  t_ok "场景闸门已关闭（sceneGate=false）→ 不适用闸门拦截判定"
 elif [ "$GATE_PASS" -eq 1 ]; then
   t_ok "闸门拦得住：第 6 秒仍停在暗幕（门限 8s，均值 ${GATE_MEAN} < 20）且提示可见（提示带 ${GATE_BAND} 亮像素）"
 else
