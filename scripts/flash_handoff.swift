@@ -252,6 +252,111 @@ func handoffBoundary() -> String {
     return lines.joined(separator: "\n")
 }
 
+
+/// 坐标兜底：WorkBuddy 5.8.3 的输入框**不在 AX 树里**（`AXTextArea` 为空），
+/// AX 路径必然在 COMPOSER 步骤失败（实测 2026-10-25）。
+/// 但它的按钮在 AX 里（`macctl click --text "新建任务"` 能命中），
+/// 说明只有 contenteditable 不暴露 —— 所以改走"坐标 + 剪贴板"。
+///
+/// 三段都复用已验证的 CLI（不新写 CGEvent 代码）：
+///   ① `macctl scwindows` 取窗口矩形 → ② `macctl click --at` 点输入框
+///   → ③ `macctl type --text`（内部走剪贴板粘贴）
+///
+/// 校验也不读 AXValue（读不到），改看**placeholder 是否消失**：
+/// 「今天帮你做些什么」这句只在空输入框里出现，它没了就说明字进去了。
+func handoffByCoordinates(_ text: String, skill: String? = nil, submit: Bool = true) -> HandoffResult {
+    var r = HandoffResult()
+    let t0 = Date()
+    func ms() -> Int { Int(Date().timeIntervalSince(t0) * 1000) }
+    let tools = scriptsDir()
+    let macctl = tools + "/macctl"
+    let bid = "com.tencent.workbuddy.mac"
+
+    func run(_ path: String, _ args: [String]) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = Pipe()
+        do { try p.run() } catch { return "" }
+        let d = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(data: d, encoding: .utf8) ?? ""
+    }
+
+    // ① 窗口矩形：取面积最大的那个（面板/提示条都不如主窗口大）
+    let wins = run(macctl, ["scwindows", "--app", bid])
+    var best: CGRect = .zero
+    for line in wins.split(separator: "\n") {
+        guard let m = line.range(of: #"@\((\d+),(\d+)\) (\d+)x(\d+)"#, options: .regularExpression) else { continue }
+        let nums = line[m].dropFirst(2).split(whereSeparator: { $0 == ")" || $0 == "(" || $0 == "," || $0 == "x" || $0 == " " })
+            .compactMap { Double($0) }
+        guard nums.count == 4 else { continue }
+        let f = CGRect(x: nums[0], y: nums[1], width: nums[2], height: nums[3])
+        if f.width * f.height > best.width * best.height { best = f }
+    }
+    guard best.width > 200, best.height > 200 else {
+        r.ok = false; r.step = "COORD"; r.detail = "找不到 WorkBuddy 主窗口"; r.ms = ms(); return r
+    }
+
+    /* ② 点输入框：**两个候选高度**都试。
+       ⚠ 2026-10-25 实测：输入框在两种页面里高度不同 ——
+          · 任务详情页：窗口内约 **38%** 高（底部输入条）
+          · 首页：约 **71%** 高（大号输入框在引导语下面）
+       兜底只在"AX 找不到"时触发，通常就是任务详情页；但两种都试更稳。 */
+    let px = Int(best.minX + best.width * 0.61)
+    r.step = "COORD_CLICK"
+
+    // ③ 粘贴（要求带唯一 marker 便于确认）
+    let marker = "hdo-\(Int(Date().timeIntervalSince1970))"
+    let payload = text + "\n<!-- \(marker) -->"
+    r.step = "COORD_PASTE"
+
+    /* ④ 校验：截图比对（**不能用 placeholder**）。
+       ⚠ 2026-10-25 实测：`macctl find --text "今天帮你做些什么"` 从来没命中过 ——
+          placeholder 根本不在 AX 树里。若拿"placeholder 消失"当成功判据，
+          这个兜底会**永远返回成功**（假阳性比失败更坏：用户以为派出去了）。
+       改成：粘贴前后各拍一张输入框区域，**像素一致 = 没粘进去**。 */
+    let region = "\(Int(best.minX + best.width * 0.05)),\(Int(best.minY + best.height * 0.40)),\(Int(best.width * 0.90)),\(Int(best.height * 0.20))"
+    let shotA = "/tmp/hdo-before.png", shotB = "/tmp/hdo-after.png"
+    _ = run(macctl, ["shot", "--rect", region, "--out", shotA])
+    RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+    _ = run(macctl, ["type", "--text", payload, "--app", bid])
+    RunLoop.current.run(until: Date().addingTimeInterval(0.7))
+    _ = run(macctl, ["shot", "--rect", region, "--out", shotB])
+    func sig(_ path: String) -> String {
+        guard let d = FileManager.default.contents(atPath: path) else { return "" }
+        return "\(d.count)"
+    }
+    // 内容变了 → 尺寸通常也变；两者都相同才判"没进去"
+    var same = sig(shotA) == sig(shotB) && sig(shotA) != ""
+    if same {
+        // 第一个高度没命中 → 换 71%（首页那种大输入框）再试一次
+        let py2 = Int(best.minY + best.height * 0.71)
+        _ = run(macctl, ["click", "--at", "\(px),\(py2)"])
+        RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+        _ = run(macctl, ["shot", "--rect", region, "--out", shotA])
+        _ = run(macctl, ["type", "--text", payload, "--app", bid])
+        RunLoop.current.run(until: Date().addingTimeInterval(0.7))
+        _ = run(macctl, ["shot", "--rect", region, "--out", shotB])
+        same = sig(shotA) == sig(shotB) && sig(shotA) != ""
+    }
+    if same {
+        r.ok = false; r.step = "COORD_VERIFY"
+        r.detail = "两个候选高度都没把字送进去"; r.ms = ms(); return r
+    }
+
+    // ⑤ 提交
+    if submit {
+        _ = run(macctl, ["key", "--key", "return"])
+        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        r.step = "COORD_SENT"
+    }
+    r.ok = true; r.detail = "坐标兜底送达（marker \(marker)）"; r.ms = ms()
+    return r
+}
+
 func handoffToWorkBuddy(_ text: String, skill: String? = nil,
                         submit: Bool = true, dumpPath: String? = nil) -> HandoffResult {
     let t0 = Date()
@@ -315,7 +420,14 @@ func handoffToWorkBuddy(_ text: String, skill: String? = nil,
         if let b = composer() { boxOpt = b; break }
         RunLoop.current.run(until: Date().addingTimeInterval(0.15))
     }
-    guard let found = boxOpt else { return fail("COMPOSER", "3 秒内没找到输入框（界面结构变了？）") }
+    guard let found = boxOpt else {
+        // AX 找不到输入框（5.8.3 的 contenteditable 不暴露）→ 走坐标兜底，
+        // 别直接失败：失败一次就少一次自动转交，用户又得手工粘。
+        hdDebug("[handoff] COMPOSER 失败 → 转坐标兜底")
+        let fb = handoffByCoordinates(text, skill: skill, submit: submit)
+        if dumpPath != nil, let p = dumpPath { try? axProbeDump("WorkBuddy").write(toFile: p, atomically: true, encoding: .utf8) }
+        return fb
+    }
     var box = found
 
     // 聚焦：Electron 只认 AXFocused + 真实点击，二者都试

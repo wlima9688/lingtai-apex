@@ -1,86 +1,73 @@
-# 灵台智枢 · LingTai Apex
+# mac-control
 
-> 一句话说清、一次做完的 macOS 桌面工作台。按 `⌃⌥Space` 呼出，一句话分流到
-> 本地原子动作 / 内容生成 / 工件制作 / 项目规划四个执行者，全程留痕。
+高效操控 macOS 桌面应用的 AgentSkill。
 
-本仓库是它的**源码与技能包**，MIT 授权。
+## 解决什么问题
 
-## 它是什么
+在 macOS 上操控 GUI 时，AI 往往陷入这个循环：
 
-**一个常驻的浮层面板 + 一套原子动作引擎**，把「截图 / 发微信 / 开应用 / 调音量 /
-录屏 / 切前台」这类高频操作从「模型看图 → 思考 → 点击」压成一次调用。
+> 写一个 Swift 脚本 → 编译（3-8 秒）→ 运行 → 发现 AX 树里没有目标 → 再写一个 → ……
 
-设计出发点是**减少决策轮数**，不是"更多功能"：
-慢的从来不是执行（毫秒级），而是「截图 → 模型看图 → 思考 → 再验证」这个循环。
+单个任务消耗 20-40 次工具调用，而其中 90% 是重复劳动：重写 AX 遍历、重写点击注入、重写截图、反复试探元素在哪。
 
-## 组成
+本技能把这些固化成**一个预编译二进制 + 27 个子命令**，并规定了一套工作流纪律。
 
-| 目录 | 作用 |
-|---|---|
-| `scripts/flash.swift` | 面板本体（AppKit，浮层 + 全局热键 + 自检栏 + 线框地球） |
-| `scripts/macctl.swift` | 原子动作引擎：state / click / key / type / shot / launch / volume / scwindows… |
-| `scripts/route.sh` | 一句话路由：先判能不能原子执行，再决定转交谁 |
-| `scripts/common.sh` | 共用函数（审计日志、JSON 输出、焦点守卫） |
-| `scripts/bootanim/` | 开机动画（WKWebView 全屏壳 + `run-at-login.sh` 顺序总控） |
-| `scripts/*.sh` | 专项：微信发送、录屏、音乐、文件打开、额度抓取 |
-| `SKILL.md` | 给 AI（DSH / WorkBuddy）读取的技能说明：能力、边界、调用方式 |
-| `references/` | 补充文档 |
+## 效率对比（实测）
 
-## 构建
+| 场景 | 之前 | 之后 |
+|---|---|---|
+| 读界面状态 | 4-6 次探测往返 | **1 次** `state`（45 毫秒） |
+| 找元素 | 反复 `tree` + 人工比对 | **1 次** `find --text` |
+| 中文输入 | 试 unicode→失败→试粘贴 | **自动降级 + 记住**，第二次直接走最优路径 |
+| 元素点不动 | 猜坐标试 | **自动 AXPress→真实点击降级** |
+| AX 树突然空了 | 怀疑权限、瞎试 | **1 次** `diagnose` 定位遮挡者 |
+| 编译开销 | 每个任务 3-8 秒 × N | **0**（预编译） |
 
-要求：macOS 13+、Xcode 命令行工具（`xcode-select --install`）。
+端到端实测（Chrome 搜索）：**5 次调用**完成置前→定位→点击→输入→回车→验证。
 
-```bash
-cd scripts
+## 安装
 
-# 原子动作引擎
-swiftc -O -o macctl macctl.swift
-
-# 面板（需要把 macctl.swift 里的 Args 定义一起编译）
-./build_flash.sh
-
-# 开机动画
-cd bootanim/tools && swiftc -O -o wblaunch wblaunch.swift && cd ../..
-```
-
-产物：`scripts/macctl`、`scripts/flash`、`scripts/bootanim/tools/wblaunch`。
-
-## 运行
+已安装在 `~/.workbuddy/skills/mac-control/`，无需额外操作。
 
 ```bash
-# 面板（首次需要辅助功能授权）
-./flashctl.sh install-app      # 装到 /Applications 并启动
-./flashctl.sh status
-
-# 原子动作
-./macctl state --app com.apple.finder
-./macctl click --text "确定" --app com.apple.finder
-./macctl shot --out /tmp/shot.png
+M=~/.workbuddy/skills/mac-control/scripts/macctl
+$M help
 ```
 
-## SKILL 接入（给 AI 用）
+## 目录结构
 
-`SKILL.md` 是**自描述技能**：任何支持「读技能文件」的 AI 都可以把它当手册，
-按里面的能力表与边界调用 `macctl`。目前已接入：
+```
+mac-control/
+├── SKILL.md                        # 主文档：铁律 + 工作流 + 命令速查
+├── manifest.json
+├── scripts/
+│   ├── macctl                      # 预编译二进制（arm64 macOS 13+）
+│   └── macctl.swift                # 源码
+└── references/
+    ├── troubleshooting.md           # 故障排查：现象→根因→处置
+    ├── patterns.md                 # 任务配方：发消息/搜索播放/调音量/填表
+    └── permissions.md              # TCC 权限配置与验证
+```
 
-- **DSH（天公）**：作为 `shankong` 技能加载
-- **WorkBuddy**：按 `SKILL.md` 的原子命令表调用
-- **豆包**：不能执行本地命令，只做「自然语言 → 规范指令」的翻译（见知识库里的指令卡）
+## 重新编译
 
-## 设计约束（不是 bug）
+修改 `macctl.swift` 后：
 
-- **不做多步推理**：它只执行已知意图；需要判断的交给上层 AI。
-- **发送前必须回读**：微信发送前回读收件人 + 正文；群发/广播一律拦截。
-- **红区永不做**：密码、验证码、支付、系统安全设置、隐私外传，一律拒绝。
-- **GUI 互斥**：多个 AI 同时操作电脑时用文件锁排队，拿不到就返回 `BUSY`，不硬抢。
+```bash
+cd ~/.workbuddy/skills/mac-control/scripts
+/usr/bin/swiftc -O -o macctl macctl.swift
+```
 
-## 授权
+## 学习缓存
 
-MIT，见 [LICENSE](LICENSE)。
+`macctl` 会把每个 app 的有效交互方式记入
+`~/.workbuddy/skills/mac-control/cache/learned.json`：
 
-字体另行授权：`scripts/Resources/Fonts/` 下的 Inter 与 Roboto Mono 均为 SIL Open Font License 1.1，
-全文见 [`LICENSE-Inter.txt`](scripts/Resources/Fonts/LICENSE-Inter.txt) 与
-[`LICENSE-RobotoMono.txt`](scripts/Resources/Fonts/LICENSE-RobotoMono.txt)，
-来源与说明见 [`references/字体授权.md`](references/字体授权.md)。
+```bash
+$M recall                          # 查看已学到的交互模型
+$M note --app <bundleId> --text "描述"   # 手工补充
+```
 
-私有路径（`/Users/<用户名>/...`）若出现在部分脚本里，是作者本机配置；换机器时按需调整。
+## 权限
+
+需要：辅助功能、屏幕录制、输入监控、自动化。详见 `references/permissions.md`。

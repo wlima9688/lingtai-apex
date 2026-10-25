@@ -516,22 +516,64 @@ func savePNG(_ img: CGImage, _ path: String) {
 //         录屏 → ~/Desktop/闪控录屏/（另一个地方）
 //   **两个位置 = 用户找不到 = 功能等于没有。**
 //   现在统一到 ~/桌面/闪控/，截图与录屏同目录，中文时间戳文件名。
-let MEDIA_DIR = "\(FileManager.default.homeDirectoryForCurrentUser.path)/Desktop/闪控"
+/* 产出统一收纳（2026-10-25 用户反馈「不知道截完图去哪找」）：
+   原来散在 `~/Desktop/闪控` 与 `~/Desktop/截图` 两处，文件名还是
+   `截图-2026年10月25日-02时01分37秒.png` 这种又长又难搜的格式。
+   ⚠ P10（2026-10-25 晚）：**截图与录屏分家 + 年/月 归档**。
+     合成一个目录试过一轮 —— 228 个文件平铺在根下，找一张图要滚半天。
+     目录即索引：
+       ~/Desktop/灵台智枢/截图/2026/10/20261025-020137.png
+       ~/Desktop/灵台智枢/录屏/2026/10/20261025-095757.mov
+     年月各一层 → 新的一天/月/年自然落到新目录，不需要任何定时任务；
+     根目录下**不许**再出现任何媒体文件（selftest 15.6 反向断言）。
+   为什么放桌面而不是 ~/Pictures：用户原话是"不知道去哪找"，
+   桌面一眼可见；深度再走一层就没人翻了。 */
+let MEDIA_ROOT = "\(FileManager.default.homeDirectoryForCurrentUser.path)/Desktop/灵台智枢"
+/// 2026-10-25 P10：截图与录屏**分家**，各自按 `年/月` 归档。
+///   <根>/截图/2026/10/20261025-102538.png
+///   <根>/录屏/2026/10/20261025-095757.mov
+/// ⚠ 根目录下**不许**再落任何媒体文件 —— 228 个文件平铺在根下的教训是
+///   「找一张图要滚半天」，目录本身就是索引。
+let MEDIA_DIR = "\(MEDIA_ROOT)/截图"   // 截图类别根
+let REC_DIR   = "\(MEDIA_ROOT)/录屏"   // 录屏类别根
 
-/// 中文时间戳文件名，如 `截图-2026年10月22日-02时18分30秒.png`
+/// 类别目录 + `年/月`（月补零），目录不存在就建。
+/// 新的一天/月/年自然落到新目录，不需要任何定时任务。
+func mediaDir(_ prefix: String, _ ext: String) -> String {
+    let e = ext.lowercased()
+    // 类别判据：用途前缀含「录」或扩展名是视频/音频 → 录屏；其余 → 截图
+    let isRec = prefix.contains("录") || e == "mov" || e == "m4a"
+    let base  = isRec ? REC_DIR : MEDIA_DIR
+    let cal = Calendar(identifier: .gregorian)
+    let now = Date()
+    let y = cal.component(.year,  from: now)
+    let m = cal.component(.month, from: now)
+    let dir = String(format: "%@/%04d/%02d", base, y, m)
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    return dir
+}
+
+/// 时间戳文件名，如 `20261025-102538.png`（P10 起不再带「截图-」中文前缀，
+/// 类别由所在目录说明：<根>/截图/2026/10/…）
 /// ⚠ 月/日/时/分/秒全部补零：这样按文件名排序 == 按时间排序，
 ///   这是用户「方便我搜索」的前提（不补零的话 2月 会排在 12月 后面）。
 func mediaStamp() -> String {
     let f = DateFormatter()
     f.locale = Locale(identifier: "en_US_POSIX")
-    f.dateFormat = "yyyy年MM月dd日-HH时mm分ss秒"
+    // 短、可排序、无空格：`20261025-020137`
+    // 保留「按文件名排序 == 按时间排序」这条性质（用户搜索的前提）
+    f.dateFormat = "yyyyMMdd-HHmmss"
     return f.string(from: Date())
 }
 
-/// 闪控媒体目录里的一个完整文件路径，并保证目录已建好
+/// 闪控媒体目录里的一个完整文件路径：<类别>/<年>/<月>/<yyyyMMdd-HHmmss>.<ext>
+/// 目录由 mediaDir() 按当下时间算好并建齐（年月各自一层，自动滚动）。
 func mediaPath(_ prefix: String, _ ext: String) -> String {
-    try? FileManager.default.createDirectory(atPath: MEDIA_DIR, withIntermediateDirectories: true)
-    return "\(MEDIA_DIR)/\(prefix)-\(mediaStamp()).\(ext)"
+    // 2026-10-25 P10：先定类别（截图/录屏），再拼 年/月，最后才是时间戳文件名。
+    // 文件名不再带用途前缀（目录已经说明了），只剩时间戳 —— 保持
+    // 「按文件名排序 == 按时间排序」这条用户搜索的前提。
+    let dir = mediaDir(prefix, ext)
+    return "\(dir)/\(mediaStamp()).\(ext)"
 }
 
 /// 从整屏截图中按屏幕逻辑坐标裁剪（注意 CG 坐标原点在左下，需翻转）
@@ -1502,13 +1544,34 @@ func cmdShot() {
     // ⚠ 截图必须要有「屏幕录制」授权。没有时 screencapture 会静默产出空/黑图，
     //   上层于是显示"✅ 截图完成"但目录里什么都没有（用户 2026-10-23 实测）。
     //   这里做前置检查 + 主动申请：申请会弹系统框，把「闪控」加进授权列表。
+    /* 2026-10-25：**不再主动申请**（CGRequestScreenCaptureAccess 会弹系统授权框，
+       而截图已改走 launchd 的 mediacap job，不需要本进程有该授权）。
+       CLI 侧（继承终端/DSH 身份）本来就能拍；真不行时只提示，不弹窗。 */
     if a.str("out").isEmpty, !CGPreflightScreenCaptureAccess() {
-        _ = CGRequestScreenCaptureAccess()
-        out("❌ 缺少「屏幕录制」授权：系统设置 > 隐私与安全性 > 屏幕录制，勾上「闪控」后重开闪控")
-        exit(3)
+        FileHandle.standardError.write("提示：本进程无「屏幕录制」授权；面板已改走 mediacap，不受影响\n".data(using: .utf8)!)
     }
     let outPath = a.str("out").isEmpty ? mediaPath("截图", "png") : a.str("out")
     let bid = a.str("app")
+
+    /* --interactive：鼠标框选区域（微信式）。
+       · `-i` 交互选区；`-x` **静音**（截图默认会放快门声）；
+       · `-o` 窗口模式下不要阴影；
+       · 用户按 Esc 取消时 screencapture 不产出文件 → 报 CANCELLED，不要谎报成功。
+       面板由调用方（灵台智枢）先隐藏，所以拍不到自己。 */
+    if ARGV.contains("--interactive") {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        p.arguments = ["-i", "-x", "-o", "-t", "png", outPath]
+        do { try p.run() } catch { die("无法启动 screencapture") }
+        p.waitUntilExit()
+        if FileManager.default.fileExists(atPath: outPath) {
+            out("已保存 \(outPath)")
+        } else {
+            out("CANCELLED 未选区（已取消，无文件）")
+            exit(4)
+        }
+        return
+    }
 
     // --app 模式：排他捕获目标 app 的主窗口（不受遮挡影响）
     if !bid.isEmpty {

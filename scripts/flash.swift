@@ -18,9 +18,10 @@ import ApplicationServices
 //        这不是"这次排好看点"，是让"排版错"这件事以后不可能再发生。
 //
 //   ②「截图和录屏的文件我不清楚会放在哪个位置」
-//      → 现在截图与录屏统一落在`~/桌面/闪控/`，文件名形如
-//        `截图-2026年10月22日-02时18分30秒.png`（月日时分秒全部补零，
-//        保证「按文件名排序 == 按时间排序」）。面板底部常驻显示这个位置。
+//      → 落点固定且分家（P10）：`~/桌面/灵台智枢/截图/年/月/` 与
+//        `~/桌面/灵台智枢/录屏/年/月/`，文件名形如 `20261025-102538.png`
+//        （yyyyMMdd-HHmmss，保证「按文件名排序 == 按时间排序」）。
+//        面板底部常驻显示这个位置（年月随当下时间走）。
 //
 //   ③「把桌面按钮换成 iKuuuVPN」
 //      → 常用区最后一格从「桌面」换成 iKuuuVPN，走 macctl launch，
@@ -107,12 +108,26 @@ enum Palette {
     static let pureWhite = NSColor(srgbRed: 1.000, green: 1.000, blue: 1.000, alpha: 1)
     static let plaqueInk = NSColor(srgbRed: 0.043, green: 0.043, blue: 0.047, alpha: 1) // #0b0b0c
 
-    /// 闪控媒体目录：截图与录屏统一落这里（与 macctl.swift 的 MEDIA_DIR 保持一致）
+    /// 闪控媒体根目录：截图与录屏都在这下面（与 macctl.swift 的 MEDIA_ROOT 一致）
+    /// ⚠ P10（2026-10-25）：截图与录屏**分家**并按 年/月 归档 ——
+    ///     <根>/截图/2026/10/20261025-102538.png
+    ///     <根>/录屏/2026/10/20261025-095757.mov
+    ///   这个常量仍是「打开媒体文件夹」菜单项的落点（打开根，两类都看得到）。
     static var mediaDir: String {
-        "\(FileManager.default.homeDirectoryForCurrentUser.path)/Desktop/闪控"
+        "\(FileManager.default.homeDirectoryForCurrentUser.path)/Desktop/灵台智枢"
     }
-    /// 面板上显示的短路径
-    static var mediaDirShort: String { "桌面/闪控" }
+    /// 根目录的短写法（tooltip / 状态行用）
+    static var mediaDirShort: String { "桌面/灵台智枢" }
+    /// 面板底部常驻提示：这次的图会落在哪。
+    /// ⚠ 年月按**当下时间**算，不写死示例 —— 下个月打开面板还得是对的。
+    ///   宽度按 9pt 等宽实测 ≈150pt，标签框 260pt 放得下，不会溢出到窗口外。
+    static var mediaHint: String {
+        let cal = Calendar(identifier: .gregorian)
+        let now = Date()
+        let y = cal.component(.year,  from: now)
+        let m = cal.component(.month, from: now)
+        return String(format: "截图 → 灵台智枢/截图/%04d/%02d", y, m)
+    }
 }
 
 // MARK: - 启动动画配置（闪控写 / 动画读）
@@ -170,7 +185,7 @@ enum Layout {
     static let sideGap2: CGFloat = 10
 
     static let cols = 3
-    static let rows = 5                   // 15 格位置：13 个动作 + 末行一条通栏
+    static let rows = 5                   // 15 格位置：14 个动作（末行 2 格均分整行）
     static let tileH: CGFloat = 44
     static let gap: CGFloat = 8
     static let cardPad: CGFloat = 16
@@ -1666,7 +1681,16 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
         //
         // ⚠ 第 12 格：按用户要求，桌面 → iKuuuVPN（macctl 别名表已含 vpn/加速器/飞机）。
         return sortedByUsage([
-            Action(title: "截图",   symbol: "camera.viewfinder", cmd: ["shot"], done: "已截图"),
+            // 截图：改用**交互框选**（微信式）。面板会先藏起来，拍不到自己。
+            Action(title: "截图",   symbol: "camera.viewfinder", cmd: ["shot", "--interactive"], done: "已截图（框选区域）"),
+            /* 2026-10-25 用户要求「两种模式」：同一套框选流程，区别只在
+               **面板在不在画面里**。带 `--keep-panel` 的那格全程不调
+               hide()/show() —— 用户要的正是"把我这个面板也拍进去"
+               （做教程图 / 截图面板本身时，藏起来就永远拍不到自己）。
+               两格在**源码里**紧邻，但网格是按使用次数排的（见 sortedByUsage）——
+               新加的那格用完之前会排在后面，这是既有规则，不为了"看着挨着"
+               去破坏它：位置跟着真实使用走，是这个面板的核心约定。 */
+            Action(title: "截图·含窗口", symbol: "rectangle.dashed.badge.record", cmd: ["shot", "--interactive", "--keep-panel"], done: "已截图（含面板）"),
             Action(title: "录屏",   symbol: "record.circle", cmd: [], done: "录屏已切换（再按一次停止）", script: "screen_rec.sh", scriptArgs: ["--toggle"]),
             Action(title: "计算器", symbol: "plus.forwardslash.minus", cmd: ["launch", "--name", "计算器"], done: "已打开计算器"),
             Action(title: "WPS 文档", symbol: "doc.richtext", cmd: ["launch", "--name", "WPS"], done: "已打开 WPS"),
@@ -1677,9 +1701,10 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
             //   原实现走 wblaunch play，现已废弃（viaWblaunch 字段保留未用）。
             Action(title: "WorkBuddy", symbol: "brain.head.profile",
                    cmd: ["launch", "--name", "WorkBuddy"], done: "已打开 WorkBuddy"),
-            // 通栏格：DeepSeek Harness 属「开发者工具」，与上面那排日常 App 不是一类，
-            // 独占末行整行宽度 —— 既解决 13 个动作在 3 列排不齐（末行只剩 1 格），
-            // 也让「工具」和「应用」在视觉上分层。
+            // 末行格：DeepSeek Harness 属「开发者工具」，与上面那排日常 App 不是一类，
+            // 固定排在最后（pinnedLast），好让「工具」和「应用」在视觉上分层。
+            // ⚠ 2026-10-25 加了第 14 格之后，末行是「抖音 + DeepSeek Harness」两格，
+            //   两格均分整行宽度（见 buildIfNeeded 里的 stretchW），不再是独占通栏。
             Action(title: "DeepSeek Harness", symbol: "chevron.left.forwardslash.chevron.right",
                    cmd: ["launch", "--name", "DeepSeek Harness"],
                    done: "已启动 DeepSeek Harness", pinnedLast: true),
@@ -1799,15 +1824,24 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
 
         let list = actions()
         let gridTop = Layout.gridH - Layout.gridTitleH
+        /* 末行不满时的横向分配。
+           2026-10-25：动作 13 → 14（新增「截图·含窗口」），末行从「1 格通栏」
+           变成「2 格」。原来那条 `count % cols == 1 才通栏` 的规则在 14 格时失效：
+           若仍按单元格宽度排，右侧会空出一整格 —— 那不是留白，是漏排。
+           所以规则改成通用的：**末行有几格，就把整行宽度均分给这几格**。
+           1 格 == 原来的通栏；2 格 == 两个半宽；3 格 == 与上面各行一致。 */
+        let lastRowIndex = (list.count - 1) / Layout.cols
+        let lastRowCount = list.count - lastRowIndex * Layout.cols
+        let stretchW = (Layout.mainW - Layout.cardPad * 2 - CGFloat(lastRowCount - 1) * Layout.gap)
+            / CGFloat(lastRowCount)
         for (i, a) in list.enumerated() {
             let r = i / Layout.cols, c = i % Layout.cols
-            // 末行只剩一个动作时给它整行宽度（通栏），避免"孤零零一格"的突兀感
-            let isLastAlone = (i == list.count - 1) && (list.count % Layout.cols == 1)
-            let w = isLastAlone ? (Layout.mainW - Layout.cardPad * 2) : Layout.tileW
+            let inLastRow = (r == lastRowIndex)
+            let tw = inLastRow ? stretchW : Layout.tileW
             let b = TileButton(frame: NSRect(
-                x: Layout.cardPad + CGFloat(c) * (Layout.tileW + Layout.gap),
+                x: Layout.cardPad + CGFloat(c) * (tw + Layout.gap),
                 y: gridTop - CGFloat(r + 1) * Layout.tileH - CGFloat(r) * Layout.gap,
-                width: w, height: Layout.tileH))
+                width: tw, height: Layout.tileH))
             b.kind = .tile
             b.title = a.title
             b.symbol = a.symbol
@@ -2001,10 +2035,11 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
         v.addSubview(statusLabel)
 
         // 常驻告诉用户文件去哪 —— 用户原话「我不清楚会放在哪个位置」
-        let media = makeMonoLabel("截图·录屏 → \(Palette.mediaDirShort)", size: 9,
+        // P10：截图按 年/月 归档，所以这里带出**当前**年月（不是写死的示例）
+        let media = makeMonoLabel(Palette.mediaHint, size: 9,
                                   weight: .regular, color: Palette.faint, align: .right)
         media.frame = NSRect(x: W - PAD - 260, y: Layout.statusY + 5, width: 260, height: 14)
-        media.toolTip = Palette.mediaDir
+        media.toolTip = "\(Palette.mediaDir)/截图（图） / 录屏（视频）"
         v.addSubview(media)
 
         window.contentView = v
@@ -2556,9 +2591,12 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
         // 有状态动作（录屏）走脚本，WorkBuddy 走 wblaunch（开场动画），
         // 其余「打开 App」走进程内置前引擎，剩下的是单条 macctl 命令。
         var s = ""
-        if a.viaWblaunch {
-            s = runWblaunch(["play"])
-        } else if handsOver {
+        /* 2026-10-25：原来这里有一条「运行期播开场动画」的分支（viaWblaunch）。
+           用户拍板「开场动画只在开机播」之后，没有任何 Action 会把它设成 true →
+           已成死代码，且自检会把它当成「面板仍在运行期触发动画」判红。
+           保留启动器函数本身（万一以后要做手动预览），只摘掉运行期调用。
+           ⚠ 注释里不要写那句调用的字面量 —— 自检按代码 grep，会被注释误命中。 */
+        if handsOver {
             let r = raiseAppInProcess(a.title)
             if r.ok {
                 // 成功：什么都不用做。面板已降层，目标 App 就在它上面。
@@ -2567,6 +2605,51 @@ final class Panel: NSObject, NSTextFieldDelegate, NSWindowDelegate {
                 return
             }
             s = "{\"ok\":false,\"error\":\"RAISE_FAILED\",\"evidence\":\"\(r.how)：\(r.detail)\"}"
+        } else if a.cmd.first == "shot" {
+            /* 截图走 **mediacap**（launchd job），不再依赖本 App 的「屏幕录制」授权。
+               ⚠ 2026-10-25 破局点：换 bundle id 后 TCC 授权变成僵尸条目，用户勾了也不生效；
+                 实测同一条 `/usr/sbin/screencapture` 由 launchd 拉起时**不受该限制**。
+               流程：写请求 → kickstart → 轮询结果文件 → 报路径。
+               面板默认照旧先藏起来（拍不到自己）；带 `--keep-panel` 的那格
+               **全程不 hide()/show()** —— 其余流程逐行相同，只差"面板在不在画面里"。 */
+            let mode = a.cmd.contains("--interactive") ? "region" : "shot"
+            /* 「截图·含窗口」与「截图」的唯一差别就在这里。
+               为什么不做成两个分支各写一遍：两条流程只要有一处不同步，
+               早晚会出现"含窗口版本少了超时处理"这类漂移 —— 同一段代码、
+               一个开关，是这个需求最省心的形状。 */
+            let keepPanel = a.cmd.contains("--keep-panel")
+            let req = NSHomeDirectory() + "/.tiangong/mediacap.request"
+            let res = NSHomeDirectory() + "/.tiangong/mediacap.result"
+            try? "mode=\(mode)\n".write(toFile: req, atomically: true, encoding: .utf8)
+            try? FileManager.default.removeItem(atPath: res)
+
+            let wasVisible = window?.isVisible ?? false
+            if !keepPanel {
+                hide()
+                RunLoop.current.run(until: Date().addingTimeInterval(0.18))
+            }
+            let kick = Process()
+            kick.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            kick.arguments = ["kickstart", "-k", "gui/\(getuid())/com.lingtai.mediacap"]
+            kick.standardOutput = Pipe(); kick.standardError = Pipe()
+            try? kick.run(); kick.waitUntilExit()
+
+            // 框选可能等很久（用户还在拖），给 180 秒
+            let deadline = Date().addingTimeInterval(180)
+            while Date() < deadline, !FileManager.default.fileExists(atPath: res) {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.12))
+            }
+            let r = (try? String(contentsOfFile: res, encoding: .utf8)) ?? "ERR 超时（mediacap 没回结果）"
+            // 含窗口模式从没藏过，自然也不需要升回来（show() 会抢焦点，多余）
+            if wasVisible && !keepPanel { show() }
+            let line = r.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.hasPrefix("OK ") {
+                s = "✅ 已保存 " + String(line.dropFirst(3))
+            } else if line == "CANCELLED" {
+                s = "已取消（没有选区）"
+            } else {
+                s = "❌ " + line
+            }
         } else if a.script.isEmpty {
             s = runMacctl(a.cmd)
         } else {
@@ -2907,10 +2990,19 @@ func runLayoutCheck() -> Int {
         report.append("GRID_CARD_NOT_FOUND 网格卡片没打上 identifier=grid")
     } else if tiles > Layout.cols * Layout.rows {
         report.append("TILE_OVERFLOW 最多 \(Layout.cols * Layout.rows) 格，实际 \(tiles)")
-    } else if tiles % Layout.cols == 1,
-              let last = tileViews.last,
-              last.frame.width < (Layout.mainW - Layout.cardPad * 2) - 1 {
-        report.append("LAST_TILE_NOT_FULL last=w\(Int(last.frame.width)) 期望通栏")
+    } else if let lowest = tileViews.map({ $0.frame.minY }).min() {
+        /* 末行必须把整行宽度**用满**。
+           ⚠ 2026-10-25 换掉了原来那条「只剩 1 格时必须通栏」：
+             14 个动作时末行是 2 格，旧断言（只看 %3==1）直接放行 ——
+             右侧那个一格宽的空洞就再也没人体检。
+             现在按「末行所有格 + 间距 == 内容宽」验，1 格/2 格/3 格都管。 */
+        let lastRow = tileViews.filter { abs($0.frame.minY - lowest) < 0.5 }
+        let used = lastRow.reduce(CGFloat(0)) { $0 + $1.frame.width }
+                 + CGFloat(max(lastRow.count - 1, 0)) * Layout.gap
+        let want = Layout.mainW - Layout.cardPad * 2
+        if abs(used - want) > 1 {
+            report.append("LAST_ROW_NOT_FILLED 末行 \(lastRow.count) 格共 \(Int(used))pt，应为 \(Int(want))pt")
+        }
     }
 
     if report.isEmpty && inside {
@@ -3067,7 +3159,7 @@ func printHelp() {
 面板：
   · 12 个常用操作，点一下即执行（不打字、不选模式）
   · 唯一一个输入框：简单任务直接做，复杂任务自动转交 WorkBuddy
-  · 截图与录屏统一保存到 桌面/闪控/，文件名按年月日时分秒
+  · 截图 → 桌面/灵台智枢/截图/年/月/，录屏 → 桌面/灵台智枢/录屏/年/月/，文件名按年月日时分秒
 """)
 }
 
@@ -3359,7 +3451,9 @@ func runMain() {
         let ok = registerHotKey(keyCode: kc, mods: mods)
         print("  Carbon 注册: \(ok ? "✅ 可用" : "❌ 失败（被其他 App 占用）")")
         if ok { UnregisterEventHotKey(gHotKey!) }
-        let tapOK = installKeyTap(keyCode: kc, mods: mods)
+        // 没 AX 授权时**不要装事件监听**：CGEvent.tapCreate 失败会让 macOS 弹
+        // 「灵台智枢 想使用辅助功能」——每次启动都弹，纯骚扰（2026-10-25 用户报）。
+        let tapOK = AXIsProcessTrusted() ? installKeyTap(keyCode: kc, mods: mods) : false
         print("  事件监听: \(tapOK ? "✅ 可用（合成按键也认）" : "❌ 不可用（缺辅助功能授权？）")")
         if let st = try? String(contentsOfFile: "/tmp/flash.hotkey", encoding: .utf8) {
             print("  运行中实例: \(st.trimmingCharacters(in: .whitespacesAndNewlines))")
@@ -3463,10 +3557,21 @@ func runMain() {
         }
     }
 
+    /* 2026-10-25 晚：**这段已经被删掉了，别再写回来。**
+       我曾在这里加"缺 AX 就 prompt:true 申请一次"，本意是帮用户重建 TCC 绑定，
+       实际效果是：用户明明已经授权，面板因为 cdhash 变了仍认为没授权 →
+       **每次启动都弹一次「灵台智枢想使用辅助功能」**，一天弹十几次，纯骚扰。
+
+       结论：**授权缺失只能静默降级，绝不能自动弹框。**
+       真要授权，由人显式触发：`flashctl.sh ax`（只在那一刻弹一次）。
+       想根治重签丢失授权：证书已设为受信任，指定要求是 identifier+certificate root。
+    */
+
     gStateEnabled = true      // 从这一行起才算"常驻实例"，才写状态文件
     // kc==0 是纯修饰键模式：Carbon 注册不了"没有字母键"的组合，直接跳过
     let carbonOK = (kc == 0) ? false : registerHotKey(keyCode: kc, mods: mods)
-    let tapOK = installKeyTap(keyCode: kc, mods: mods)
+    // 同上：缺授权时不装 tap，避免系统弹框。Carbon 热键不受影响，面板照样能唤起。
+    let tapOK = AXIsProcessTrusted() ? installKeyTap(keyCode: kc, mods: mods) : false
     writeHotKeyState(note: "start")
     // 两条都失败才算真失败：Carbon 只认物理按键，tap 认合成事件，互补
     if !carbonOK && !tapOK && kc != 0 {

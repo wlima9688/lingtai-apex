@@ -90,7 +90,7 @@ security import sk.p12 -k ~/Library/Keychains/login.keychain-db -T /usr/bin/code
 
 ```bash
 codesign -d -r- ~/.workbuddy/skills/mac-control/scripts/flash
-# designated => identifier "com.shankong.flash" and certificate root = H"8296c5f8…"
+# designated => identifier "com.lingtai.apex" and certificate root = H"8296c5f8…"
 ```
 
 只要这条要求里的**证书根不变**，重编译就不会让授权失效。

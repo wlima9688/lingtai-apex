@@ -990,7 +990,16 @@ enum Probe {
             if let quotas = st["quotas"] as? [String: Any] {
                 func quota(_ key: String) -> (String, Bool) {
                     guard let item = quotas[key] as? [String: Any] else { return ("?", false) }
-                    return (item["value"] as? String ?? "?", item["ok"] as? Bool ?? false)
+                    /* 优先用 value_compact：侧栏只有 208pt。
+                       DeepSeek 那一行的正式口径是
+                       `¥88.03 余 · 已用 ¥15.00（自 10-25）`（29 字 ≈188pt），
+                       整串排进来会把 DEEPSEEK 标签压掉 —— 所以 panel-status
+                       另给一个同义的短版；CLI / JSON 的 value 仍是完整口径。
+                       ⚠ 不要在这里自己截断 value：砍掉「（自 10-25）」会让
+                         「已用」变成没有基准的数字，比不显示更误导。 */
+                    let compact = item["value_compact"] as? String ?? ""
+                    let value = compact.isEmpty ? (item["value"] as? String ?? "?") : compact
+                    return (value, item["ok"] as? Bool ?? false)
                 }
                 let ds = quota("deepseek"); s.dsQuota = ds.0; s.dsQuotaOK = ds.1
                 let wb = quota("workbuddy"); s.wbQuota = wb.0; s.wbQuotaOK = wb.1

@@ -279,10 +279,93 @@ case "$cmd" in
     ;;
 
   # ── 显式申请辅助功能授权（只在这里才弹系统框，平时绝不打扰）──────
+  #
+  # ⚠⚠ 这一支曾经写的是 `SHANKONG_AX_PROMPT=1 "$DIR/flash" --status`，
+  #   **从来就没有生效过**（两个独立的死因叠在一起）：
+  #     1. flash.swift 的 --status 段打完状态就 `exit(0)`（约 3447 行），
+  #        根本走不到 3519 行那段「按 SHANKONG_AX_PROMPT 弹授权框」的代码；
+  #     2. 就算走到了也不会弹 —— 从终端直接跑会继承**终端自己**的 TCC 授权身份，
+  #        系统认为要申请授权的是「终端」，灵台智枢仍然没有被登记。
+  #   唯一有效的做法（桌面「修复辅助功能授权.command」实测）：
+  #     · 先用 tccutil 清掉旧的僵尸记录（改 bundle id / 重签后会残留一条
+  #       「显示已勾选、实际绑旧哈希」的死条目，手动勾多少遍都没用）；
+  #     · 用 PlistBuddy 给 LaunchAgent **临时**注入 SHANKONG_AX_PROMPT=1，
+  #       再 bootout/bootstrap/kickstart —— **必须由 launchd 拉起**，
+  #       进程才会以灵台智枢自己的身份去申请；
+  #     · 用户勾完回车后撤掉变量、重启面板、回读 ax= 值验证。
+  #   全程只弹这一次；弹窗代码默认静默（见 ERR-0023）。
   ax)
-    SHANKONG_AX_PROMPT=1 "$DIR/flash" --status >/dev/null 2>&1 &
+    UID_N="$(id -u)"
+    if [ ! -f "$PLIST" ]; then
+      echo "❌ 还没注册开机自启（缺 $PLIST）"
+      echo "   先跑：$0 install   然后再跑 $0 ax"
+      exit 1
+    fi
+
+    echo "═══ 灵台智枢 · 辅助功能授权 ═══"
+    echo "  只会弹这一次授权框，之后不再弹。"
+    echo ""
+
+    # ① 清掉旧记录（僵尸条目）
+    echo "① 清理旧的授权记录"
+    tccutil reset "Accessibility" "$LABEL" 2>&1 | head -1
+    echo "   ✅ 已清空（系统设置里那条「灵台智枢」会消失，这是正常的）"
+    echo ""
+
+    # ② 临时注入环境变量，让 **launchd 拉起的** 面板主动申请一次
+    echo "② 让 launchd 拉起的面板申请授权"
+    /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:SHANKONG_AX_PROMPT" "$PLIST" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$PLIST" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:SHANKONG_AX_PROMPT string 1" "$PLIST" 2>/dev/null
+    if ! /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:SHANKONG_AX_PROMPT" "$PLIST" 2>/dev/null | grep -q 1; then
+      echo "   ❌ 写 plist 失败（$PLIST 不可写？）"
+      exit 1
+    fi
+    # ⚠ 顺序不能换：先 bootout 再 pkill，否则 KeepAlive 会在杀掉后立刻拉起一份
+    #   没带环境变量的旧实例，把申请时机吃掉。
+    launchctl bootout "gui/$UID_N/$LABEL" 2>/dev/null
+    pkill -f "MacOS/flash" 2>/dev/null
     sleep 1
-    echo "已申请：系统会弹一次「闪控/flash 想使用辅助功能」，点「打开系统设置」勾上即可。"
+    launchctl bootstrap "gui/$UID_N" "$PLIST" 2>/dev/null
+    launchctl kickstart -k "gui/$UID_N/$LABEL" 2>/dev/null
+    sleep 4
+    echo "   ✅ 面板已由 launchd 重启，授权框应该已经弹出来了"
+    echo ""
+
+    # ③ 让用户去勾（这一次）
+    echo "③ 请你操作（就这一次）"
+    echo "   屏幕上的框：「灵台智枢」想使用辅助功能来控制这台电脑"
+    echo "     → 点「打开系统设置」"
+    echo "     → 在「辅助功能」列表里找到「灵台智枢」，把开关打开"
+    echo "     → 列表里没有就点左下角 + 号，选 $APP_BUNDLE"
+    printf '\n   勾好了就按回车，我来收尾：'
+    read -r _ </dev/tty 2>/dev/null || { echo ""; echo "   （没有交互终端，3 秒后自动继续）"; sleep 3; }
+    echo ""
+
+    # ④ 撤掉临时变量并重启面板
+    echo "④ 撤掉临时变量并重启面板"
+    /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:SHANKONG_AX_PROMPT" "$PLIST" 2>/dev/null
+    /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables" "$PLIST" 2>/dev/null
+    launchctl bootout "gui/$UID_N/$LABEL" 2>/dev/null
+    pkill -f "MacOS/flash" 2>/dev/null
+    sleep 1
+    launchctl bootstrap "gui/$UID_N" "$PLIST" 2>/dev/null
+    launchctl kickstart -k "gui/$UID_N/$LABEL" 2>/dev/null
+    sleep 4
+    echo "   ✅ 面板已重启"
+    echo ""
+
+    # ⑤ 验证：回读运行实例自己写的 /tmp/flash.hotkey 里的 ax=
+    echo "⑤ 验证"
+    ax_val="$(tr ' ' '\n' < /tmp/flash.hotkey 2>/dev/null | grep '^ax=' | head -1)"
+    if [ "$ax_val" = "ax=1" ]; then
+      echo "   ✅ 辅助功能已生效（${ax_val}）—— 面板现在可以控制其它 App 了"
+    else
+      echo "   ❌ 仍是 ${ax_val:-（读不到 /tmp/flash.hotkey）}"
+      echo "      可能原因：勾的是旧条目 / 勾完没让面板重启 / 勾的时候面板没退出"
+      echo "      再跑一次 $0 ax 即可（可重复执行，安全）。"
+    fi
+    echo "   热键状态：$(tr ' ' '\n' < /tmp/flash.hotkey 2>/dev/null | grep -E '^(carbon|tap|ax)=' | tr '\n' ' ')"
     ;;
 
   open)
@@ -395,9 +478,9 @@ PYEOF
     else
       echo "⑥ 路由        今天还没有审计日志"
     fi
-    # 7 媒体目录
-    if [ -w "$HOME/Desktop/闪控" ] || mkdir -p "$HOME/Desktop/闪控" 2>/dev/null; then
-      echo "⑦ 截图目录    ✅ ~/Desktop/闪控"
+    # 7 媒体目录（2026-10-25：截图与录屏合成一个目录，png/mov 并排）
+    if [ -w "$HOME/Desktop/灵台智枢" ] || mkdir -p "$HOME/Desktop/灵台智枢" 2>/dev/null; then
+      echo "⑦ 截图目录    ✅ ~/Desktop/灵台智枢"
     else
       echo "⑦ 截图目录    ❌ 不可写"; bad=1
     fi

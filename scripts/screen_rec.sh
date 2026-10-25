@@ -42,17 +42,20 @@ done
 PID_FILE="$DIR/.screenrec.pid"
 OUT_FILE_FILE="$DIR/.screenrec.out"     # ⚠ 输出路径必须持久化（见下）
 
-# ── 统一的媒体目录（与截图共用，见 D-023）────────────────────
+# ── 统一的媒体目录（与截图同根，见 D-023）────────────────────
 # ⚠ 用户原话：「截图和录屏的文件我并不清楚会放在哪个位置」。
 #   原来截图在 /tmp/macctl-shot-<时间戳>.png（重启即丢、用户找不到），
 #   录屏在 ~/Desktop/闪控录屏/（另一个地方）。**两个位置 = 用户找不到。**
-#   现在统一：所有闪控产出的截图/录屏都在 ~/桌面/闪控/ 下。
-MEDIA_DIR="$HOME/Desktop/闪控"
+#   现在统一根：~/桌面/灵台智枢/
+#   P10（2026-10-25）：录屏落 `<根>/录屏/<年>/<月>/`，与截图分家（图/视频各自一类）。
+#   ⚠ 这里只是**默认值**：真正的目录在 do_start 里按「开始录制那一刻」算，
+#     跨月录制不会因为脚本启动时间而写错月份。
+MEDIA_DIR="$HOME/Desktop/灵台智枢/录屏"
 
 # 中文时间戳文件名：录屏-2026年10月22日-02时18分30秒.mov
 # ⚠ 月/日/时/分/秒全部补零（%m/%d/%H/%M/%S），这样按文件名排序
 #   就是按时间排序 —— 用户说「方便我搜索」，补零是这一点的前提。
-stamp_cn() { date "+%Y年%m月%d日-%H时%M分%S秒"; }
+stamp_cn() { date "+%Y%m%d-%H%M%S"; }   # 短、可排序、无空格
 
 # ── 当前录制目标文件 ───────────────────────────────────────────
 # ⚠⚠ 原来每次调用都用 `date +%Y%m%d-%H%M%S` 重算 OUT_FILE。
@@ -85,10 +88,13 @@ do_start() {
     emit 1 "screen_rec" "start" 0 "已在录制中（再按一次停止）" "" "recording" "true"
     return
   fi
-  mkdir -p "$MEDIA_DIR"
+  # P10：录屏按 年/月 归目录，**按当下时间算**（不用脚本级固定值）
+  local REC_DIR_CUR
+  REC_DIR_CUR="$MEDIA_DIR/$(date +%Y)/$(date +%m)"
+  mkdir -p "$REC_DIR_CUR"
   rm -f "$PID_FILE" "$OUT_FILE_FILE"
   # ⚠ 路径一旦定下就持久化，后续所有子命令都读它（见current_out 上方注释）
-  OUT_FILE="$MEDIA_DIR/录屏-$(stamp_cn).mov"
+  OUT_FILE="$REC_DIR_CUR/$(stamp_cn).mov"
   echo "$OUT_FILE" > "$OUT_FILE_FILE"
 
   if [ "$SECONDS_LIMIT" -gt 0 ]; then
@@ -107,7 +113,7 @@ do_start() {
     if ! is_recording; then
       rm -f "$PID_FILE"
       audit "screen_rec" "screen_rec.sh" "$LEVEL_L0" "fail" "$ERR_PERMISSION_DENIED" "录屏文件未生成"
-      emit 0 "screen_rec" "start" 0 "无法启动录屏。请到「系统设置 → 隐私与安全性 → 屏幕录制」里给终端（或闪控）打勾" "$ERR_PERMISSION_DENIED"
+      emit 0 "screen_rec" "start" 0 "无法启动录屏：需要「屏幕录制」授权（系统设置 → 隐私与安全性 → 屏幕录制 → + 添加 灵台智枢）。截图不需要授权，录屏需要" "$ERR_PERMISSION_DENIED"
       return
     fi
   fi
@@ -145,7 +151,9 @@ do_stop() {
     return
   fi
   audit "screen_rec" "screen_rec.sh" "$LEVEL_L0" "ok" "" "已保存 $OUT_FILE ($cur_size 字节)"
-  emit 1 "screen_rec" "stop" 0 "✓ 已保存：桌面/闪控/$(basename "$OUT_FILE")" "" \
+  # 回显给用户看的路径：桌面/灵台智枢/录屏/年/月/xxx.mov（P10 后的真实位置）
+  local REL_OUT="桌面/${OUT_FILE#"$HOME"/Desktop/}"
+  emit 1 "screen_rec" "stop" 0 "✓ 已保存：$REL_OUT" "" \
     "out" "$(json_str "$OUT_FILE")" "bytes" "$cur_size" "recording" "false"
   rm -f "$OUT_FILE_FILE"
 }
